@@ -1,0 +1,12 @@
+{
+  "name": "rekordbox-tools",
+  "version": "1.0.0",
+  "description": "Read Rekordbox USB exports without the Rekordbox app",
+  "scripts": {
+    "list": "node read_history.js --list",
+    "history": "node read_history.js"
+  },
+  "dependencies": {
+    "rekordbox-parser": "^0.1.2"
+  }
+}

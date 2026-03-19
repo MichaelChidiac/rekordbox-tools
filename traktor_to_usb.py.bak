@@ -1,0 +1,503 @@
+#!/usr/bin/env python3.11
+"""
+traktor_to_usb.py
+=================
+Exports selected Traktor playlists directly to a Pioneer USB drive,
+bypassing Rekordbox entirely.
+
+What it produces on the USB:
+  /Contents/<artist>/<title>.<ext>          — audio files
+  /PIONEER/rekordbox/exportLibrary.db       — SQLCipher DB (CDJ-3000 / XDJ-RX3)
+  /PIONEER/USBANLZ/<uuid>/ANLZ0000.DAT/.EXT — waveform/cue analysis files
+
+Requirements:
+  • Tracks must already be analyzed in Rekordbox (ANLZ files present locally)
+  • python3.11, sqlcipher3, pyrekordbox
+
+Usage:
+  python3.11 traktor_to_usb.py --usb /Volumes/MYUSB
+  python3.11 traktor_to_usb.py --usb /Volumes/MYUSB --playlists "03 - Events" "04 - History"
+  python3.11 traktor_to_usb.py --usb /Volumes/MYUSB --all
+  python3.11 traktor_to_usb.py --usb /Volumes/MYUSB --dry-run
+"""
+
+import argparse, datetime, os, shutil, time, uuid, zlib
+from pathlib import Path
+from urllib.parse import unquote, quote
+import xml.etree.ElementTree as ET
+
+import sqlcipher3 as sqlite3
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+MASTER_DB   = Path.home() / "Library/Pioneer/rekordbox/master.db"
+XML_PATH    = Path.home() / "projects/rekordbox-tools/traktor_to_rekordbox.xml"
+KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
+
+PIONEER_DIR = "PIONEER"   # visible (non-hidden) for FAT32/exFAT compatibility
+AUDIO_DIR   = "Contents"
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def ts():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond//1000:03d} +00:00'
+
+def now_ms():
+    return int(time.time() * 1000)
+
+def make_id(s):
+    return zlib.crc32(s.encode('utf-8')) & 0xFFFFFFFF
+
+def new_uuid():
+    return str(uuid.uuid4())
+
+def to_hex(n):
+    return format(int(n), 'X').upper()
+
+def open_master():
+    con = sqlite3.connect(str(MASTER_DB))
+    con.execute(f"PRAGMA key='{KEY}'")
+    con.execute("PRAGMA cipher='sqlcipher'")
+    con.execute("PRAGMA legacy=4")
+    return con
+
+def open_usb_db(path: Path):
+    """Open (or create) the exportLibrary.db on the USB drive."""
+    con = sqlite3.connect(str(path))
+    con.execute(f"PRAGMA key='{KEY}'")
+    con.execute("PRAGMA cipher='sqlcipher'")
+    con.execute("PRAGMA legacy=4")
+    con.execute("PRAGMA foreign_keys=OFF")
+    return con
+
+# ── Schema init ────────────────────────────────────────────────────────────────
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS djmdContent (
+    ID VARCHAR(255) PRIMARY KEY, FolderPath VARCHAR(255), FileNameL VARCHAR(255),
+    Title VARCHAR(255), ArtistID VARCHAR(255), BPM INTEGER, Length INTEGER,
+    FileType INTEGER DEFAULT 1, BitRate INTEGER, SampleRate INTEGER,
+    Commnt VARCHAR(255), Rating INTEGER DEFAULT 0, ColorID INTEGER DEFAULT 0,
+    KeyID INTEGER, UUID VARCHAR(255),
+    rb_data_status INTEGER DEFAULT 257,
+    rb_local_data_status INTEGER DEFAULT 0, rb_local_deleted TINYINT DEFAULT 0,
+    rb_local_synced TINYINT DEFAULT 0, rb_local_usn BIGINT,
+    created_at DATETIME, updated_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS djmdArtist (
+    ID VARCHAR(255) PRIMARY KEY, Name VARCHAR(255), UUID VARCHAR(255),
+    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
+    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
+    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS djmdPlaylist (
+    ID VARCHAR(255) PRIMARY KEY, Seq INTEGER, Name VARCHAR(255),
+    Attribute INTEGER DEFAULT 0, ParentID VARCHAR(255) DEFAULT 'root',
+    SmartList TEXT, UUID VARCHAR(255),
+    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
+    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
+    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS djmdSongPlaylist (
+    ID VARCHAR(255) PRIMARY KEY, PlaylistID VARCHAR(255), ContentID VARCHAR(255),
+    TrackNo INTEGER, UUID VARCHAR(255),
+    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
+    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
+    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS djmdCue (
+    ID VARCHAR(255) PRIMARY KEY, ContentID VARCHAR(255),
+    InMsec INTEGER, InFrame INTEGER DEFAULT 0, InMpegFrame INTEGER DEFAULT 0,
+    InMpegAbs INTEGER DEFAULT 0, OutMsec INTEGER DEFAULT -1,
+    OutFrame INTEGER DEFAULT 0, OutMpegFrame INTEGER DEFAULT 0,
+    OutMpegAbs INTEGER DEFAULT 0, Kind INTEGER DEFAULT 0,
+    Color INTEGER DEFAULT -1, ColorTableIndex INTEGER DEFAULT -1,
+    ActiveLoop INTEGER DEFAULT 0, Comment VARCHAR(255),
+    BeatLoopSize INTEGER DEFAULT 0, CueMicrosec INTEGER DEFAULT 0,
+    ContentUUID VARCHAR(255), UUID VARCHAR(255),
+    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
+    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
+    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS djmdKey (
+    ID INTEGER PRIMARY KEY, ScaleName VARCHAR(255), Seq INTEGER
+);
+CREATE TABLE IF NOT EXISTS djmdColor (
+    ID INTEGER PRIMARY KEY, ColorCode INTEGER, SortKey INTEGER, Name VARCHAR(255)
+);
+CREATE TABLE IF NOT EXISTS djmdProperty (
+    DBID VARCHAR(255), DeviceID VARCHAR(255), LocalPath VARCHAR(255),
+    UUID VARCHAR(255), rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
+);
+"""
+
+def init_usb_db(con, usb_path: Path):
+    """Create schema and seed reference tables."""
+    con.executescript(SCHEMA_SQL)
+
+    # Seed djmdKey from master
+    master = open_master()
+    keys = master.execute("SELECT ID, ScaleName, Seq FROM djmdKey").fetchall()
+    for k in keys:
+        con.execute("INSERT OR IGNORE INTO djmdKey VALUES (?,?,?)", k)
+    colors = master.execute("SELECT ID, ColorCode, SortKey, Name FROM djmdColor").fetchall()
+    for c in colors:
+        con.execute("INSERT OR IGNORE INTO djmdColor VALUES (?,?,?,?)", c)
+    master.close()
+
+    # djmdProperty — device identity
+    db_id   = str(make_id(str(usb_path)))
+    dev_id  = new_uuid()
+    con.execute("INSERT OR REPLACE INTO djmdProperty VALUES (?,?,?,?,1,?,?)",
+                (db_id, dev_id, '/', new_uuid(), ts(), ts()))
+    con.commit()
+
+# ── Playlist selection ─────────────────────────────────────────────────────────
+def get_playlist_tree(con):
+    """Return {name_path_tuple: (id, attribute)} from master djmdPlaylist."""
+    def recurse(parent_id, prefix):
+        result = {}
+        for r in con.execute(
+            "SELECT ID, Name, Attribute FROM djmdPlaylist WHERE ParentID=?",
+            (str(parent_id),)
+        ).fetchall():
+            path = prefix + (r[1],)
+            result[path] = (str(r[0]), r[2])
+            result.update(recurse(r[0], path))
+        return result
+    # Root items
+    tree = {}
+    for r in con.execute("SELECT ID, Name, Attribute FROM djmdPlaylist WHERE ParentID='root'").fetchall():
+        path = (r[1],)
+        tree[path] = (str(r[0]), r[2])
+        tree.update(recurse(r[0], path))
+    return tree
+
+def collect_playlist_ids(tree, selected_roots):
+    """Return set of playlist IDs that are under any of the selected root names."""
+    selected = set()
+    for path, (pl_id, attr) in tree.items():
+        if attr == 0:  # playlist (not folder)
+            # Include if any path segment matches a selected root
+            if not selected_roots or any(seg in selected_roots for seg in path):
+                selected.add(pl_id)
+    return selected
+
+# ── Core export logic ──────────────────────────────────────────────────────────
+def export_to_usb(usb_path: Path, selected_roots: list, export_all: bool, dry_run: bool):
+    usb_pioneer = usb_path / PIONEER_DIR
+    usb_rb_dir  = usb_pioneer / "rekordbox"
+    usb_anlz    = usb_pioneer / "USBANLZ"
+    usb_audio   = usb_path / AUDIO_DIR
+    usb_db_path = usb_rb_dir / "exportLibrary.db"
+
+    print(f"\n{'[DRY RUN] ' if dry_run else ''}Exporting to: {usb_path}")
+
+    # ── Get track list from master.db ─────────────────────────────────────────
+    master = open_master()
+
+    tree = get_playlist_tree(master)
+    roots = None if export_all else (selected_roots or None)
+    playlist_ids = collect_playlist_ids(tree, roots)
+
+    if roots and not playlist_ids:
+        master.close()
+        top_level = sorted({path[0] for path in tree})
+        raise SystemExit(
+            f"No playlists found matching: {roots}\n"
+            f"Top-level folders available:\n" +
+            '\n'.join(f"  • {n}" for n in top_level)
+        )
+
+    print(f"  Selected playlists: {len(playlist_ids)}")
+
+    # Get all content IDs in selected playlists
+    if playlist_ids:
+        ph = ','.join('?' * len(playlist_ids))
+        content_ids = set(
+            r[0] for r in master.execute(
+                f"SELECT DISTINCT ContentID FROM djmdSongPlaylist WHERE PlaylistID IN ({ph})",
+                list(playlist_ids)
+            ).fetchall()
+        )
+    else:
+        # --all: export every track
+        content_ids = set(r[0] for r in master.execute("SELECT ID FROM djmdContent").fetchall())
+
+    print(f"  Tracks to export: {len(content_ids)}")
+
+    # Load full track info
+    tracks = {}
+    for cid in content_ids:
+        r = master.execute("""
+            SELECT c.ID, c.FolderPath, c.FileNameL, c.Title, c.BPM, c.Length,
+                   c.FileType, c.BitRate, c.SampleRate, c.Commnt, c.Rating,
+                   c.ColorID, c.KeyID, c.UUID, a.Name
+            FROM djmdContent c
+            LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
+            WHERE c.ID = ?
+        """, (cid,)).fetchone()
+        if r:
+            tracks[cid] = r
+
+    # Load ANLZ file mapping: ContentID → [(usb_path, local_path)]
+    anlz_map = {}
+    if content_ids:
+        ph = ','.join('?' * len(content_ids))
+        for r in master.execute(
+            f"SELECT ContentID, Path, rb_local_path FROM contentFile WHERE ContentID IN ({ph})",
+            list(content_ids)
+        ).fetchall():
+            anlz_map.setdefault(r[0], []).append((r[1], r[2]))
+
+    # Load cue points
+    cues = {}
+    if content_ids:
+        for r in master.execute(
+            f"SELECT * FROM djmdCue WHERE ContentID IN ({ph})",
+            list(content_ids)
+        ).fetchall():
+            cues.setdefault(r[1], []).append(r)
+
+    print(f"  Tracks with ANLZ:  {sum(1 for cid in content_ids if cid in anlz_map)}")
+    print(f"  Tracks with cues:  {sum(1 for cid in content_ids if cid in cues)}")
+    master.close()
+
+    if dry_run:
+        print("\n[DRY RUN] Would create:")
+        print(f"  {usb_db_path}")
+        print(f"  {usb_audio}/<artist>/<file>  × {len(tracks)}")
+        print(f"  {usb_anlz}/...  × {sum(len(v) for v in anlz_map.values())} files")
+        return
+
+    # ── Create directory structure ────────────────────────────────────────────
+    for d in [usb_rb_dir, usb_anlz, usb_audio]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    usb_db_path.unlink(missing_ok=True)  # fresh DB every time
+    usb_con = open_usb_db(usb_db_path)
+    init_usb_db(usb_con, usb_path)
+    usn = 1
+
+    # ── Artist dedup cache ────────────────────────────────────────────────────
+    artist_cache = {}  # name → usb artist ID
+    def get_or_insert_artist(name):
+        if not name:
+            return None
+        if name in artist_cache:
+            return artist_cache[name]
+        aid = str(make_id(f"artist:{name}"))
+        usb_con.execute("""INSERT OR IGNORE INTO djmdArtist
+            (ID,Name,UUID,rb_data_status,rb_local_data_status,rb_local_deleted,
+             rb_local_synced,rb_local_usn,created_at,updated_at)
+            VALUES (?,?,?,0,0,0,0,?,?,?)""",
+            (aid, name, new_uuid(), usn, ts(), ts()))
+        artist_cache[name] = aid
+        return aid
+
+    # ── Copy tracks + ANLZ + insert into DB ──────────────────────────────────
+    copied_audio = 0
+    copied_anlz  = 0
+    missing_audio = []
+    missing_anlz  = []
+
+    for cid, row in tracks.items():
+        (db_id, folder_path, filename, title, bpm, length, ftype,
+         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name) = row
+
+        # ── Audio file ──────────────────────────────────────────────────────
+        src_audio = Path(folder_path)
+        if not src_audio.exists():
+            missing_audio.append(folder_path)
+            usb_audio_rel = f"/{AUDIO_DIR}/Unknown/{filename}"
+        else:
+            # Preserve artist subfolder structure
+            artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
+            dst_dir = usb_audio / artist_slug
+            dst_dir.mkdir(exist_ok=True)
+            dst_audio = dst_dir / filename
+            if not dst_audio.exists():
+                shutil.copy2(src_audio, dst_audio)
+                copied_audio += 1
+            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
+
+        # ── ANLZ files ──────────────────────────────────────────────────────
+        usb_anlz_rel = None
+        for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
+            if not local_anlz_path:
+                continue
+            src = Path(local_anlz_path)
+            if not src.exists():
+                missing_anlz.append(local_anlz_path)
+                continue
+            # Preserve ANLZ subdirectory structure on USB
+            # usb_anlz_path = /PIONEER/USBANLZ/<subdir>/ANLZ0000.DAT
+            rel = usb_anlz_path.lstrip('/')
+            # strip PIONEER/USBANLZ prefix
+            parts = Path(rel).parts
+            if len(parts) >= 3 and parts[0] == 'PIONEER' and parts[1] == 'USBANLZ':
+                dst_anlz = usb_path / PIONEER_DIR / 'USBANLZ' / Path(*parts[2:])
+            else:
+                dst_anlz = usb_anlz / Path(rel)
+            dst_anlz.parent.mkdir(parents=True, exist_ok=True)
+            if not dst_anlz.exists():
+                shutil.copy2(src, dst_anlz)
+                copied_anlz += 1
+            if usb_anlz_path.endswith('.DAT') and usb_anlz_rel is None:
+                usb_anlz_rel = '/' + str(Path(PIONEER_DIR) / 'USBANLZ' / Path(*parts[2:]))
+
+        # ── Insert into exportLibrary.db ─────────────────────────────────────
+        artist_id = get_or_insert_artist(artist_name)
+        usb_con.execute("""INSERT OR REPLACE INTO djmdContent (
+            ID,FolderPath,FileNameL,Title,ArtistID,BPM,Length,
+            FileType,BitRate,SampleRate,Commnt,Rating,ColorID,KeyID,
+            UUID,rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+            rb_local_usn,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,257,0,0,0,?,?,?)""",
+            (str(db_id), usb_audio_rel, filename, title or filename,
+             artist_id, bpm, length, ftype, bitrate, samplerate,
+             comment, rating, color_id, key_id,
+             track_uuid or new_uuid(), usn, ts(), ts()))
+
+        # Insert cue points
+        for cue in cues.get(cid, []):
+            # cue tuple: (ID,ContentID,InMsec,InFrame,InMpegFrame,InMpegAbs,
+            #             OutMsec,OutFrame,OutMpegFrame,OutMpegAbs,Kind,Color,
+            #             ColorTableIndex,ActiveLoop,Comment,BeatLoopSize,
+            #             CueMicrosec,ContentUUID,UUID,rb_data_status,
+            #             rb_local_data_status,rb_local_deleted,rb_local_synced,
+            #             rb_local_usn,created_at,updated_at)
+            usb_con.execute("""INSERT OR IGNORE INTO djmdCue (
+                ID,ContentID,InMsec,InFrame,InMpegFrame,InMpegAbs,
+                OutMsec,OutFrame,OutMpegFrame,OutMpegAbs,Kind,Color,
+                ColorTableIndex,ActiveLoop,Comment,BeatLoopSize,CueMicrosec,
+                ContentUUID,UUID,rb_data_status,rb_local_data_status,
+                rb_local_deleted,rb_local_synced,rb_local_usn,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?)""",
+                (cue[0], str(db_id), cue[2], cue[3], cue[4], cue[5],
+                 cue[6], cue[7], cue[8], cue[9], cue[10], cue[11],
+                 cue[12], cue[13], cue[14], cue[15], cue[16],
+                 cue[17], cue[18], usn, ts(), ts()))
+
+    usb_con.commit()
+    print(f"\n  ✅ Audio:   {copied_audio} copied, {len(missing_audio)} missing")
+    print(f"  ✅ ANLZ:    {copied_anlz} copied, {len(missing_anlz)} missing")
+
+    # ── Insert playlist tree ──────────────────────────────────────────────────
+    master = open_master()
+    all_tree = get_playlist_tree(master)
+    master.close()
+
+    manifest_nodes = []
+    pl_count = fold_count = link_count = 0
+
+    # Build folder ancestry set — we need all folders that are ancestors
+    # of selected playlists, even if not directly selected
+    needed_paths = set()
+    for path, (pl_id, attr) in all_tree.items():
+        if attr == 0 and pl_id in playlist_ids:
+            # Add all ancestor paths
+            for i in range(1, len(path) + 1):
+                needed_paths.add(path[:i])
+
+    # Track sibling Seq per parent — ensures correct display order
+    sibling_seq = {}  # parent_id → next_seq
+
+    sorted_paths = sorted(needed_paths, key=lambda p: (len(p), p))
+    for path in sorted_paths:
+        (pl_id, attr) = all_tree.get(path, (None, None))
+        if pl_id is None:
+            continue
+        parent_path = path[:-1]
+        parent_db_id = all_tree.get(parent_path, ('root',))[0] if parent_path else 'root'
+
+        # Assign deterministic Seq among siblings
+        parent_key = str(parent_db_id)
+        seq = sibling_seq.get(parent_key, 0)
+        sibling_seq[parent_key] = seq + 1
+
+        name = path[-1]
+        manifest_nodes.append((int(pl_id), int(parent_db_id) if parent_db_id != 'root' else 0, attr))
+
+        usb_con.execute("""INSERT OR REPLACE INTO djmdPlaylist
+            (ID,Seq,Name,Attribute,ParentID,UUID,
+             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+             rb_local_usn,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?)""",
+            (str(pl_id), seq, name, attr,
+             str(parent_db_id) if parent_db_id != 'root' else 'root',
+             new_uuid(), usn, ts(), ts()))
+
+        if attr == 0:
+            pl_count += 1
+            # Insert song-playlist links (batch fetch, not per-playlist re-open)
+            master = open_master()
+            links = master.execute(
+                "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
+                (str(pl_id),)
+            ).fetchall()
+            master.close()
+            for link in links:
+                if str(link[1]) in content_ids:
+                    usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
+                        (ID,PlaylistID,ContentID,TrackNo,UUID,
+                         rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                         rb_local_usn,created_at,updated_at)
+                        VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
+                        (str(link[0]), str(pl_id), str(link[1]), link[2],
+                         new_uuid(), usn, ts(), ts()))
+                    link_count += 1
+        else:
+            fold_count += 1
+
+    usb_con.commit()
+    print(f"  ✅ Playlists: {pl_count} playlists, {fold_count} folders, {link_count} links")
+
+    # ── Write masterPlaylists6.xml on USB ─────────────────────────────────────
+    xml_manifest = usb_rb_dir / "masterPlaylists6.xml"
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '',
+        '<MASTER_PLAYLIST Version="3.0.0" AutomaticSync="0">',
+        '  <PRODUCT Name="rekordbox" Version="6.8.5" Company="Pioneer DJ"/>',
+        '  <PLAYLISTS>',
+    ]
+    ts_ms = now_ms()
+    for (dec_id, parent_dec_id, attribute) in manifest_nodes:
+        hex_id     = to_hex(dec_id)
+        parent_hex = to_hex(parent_dec_id) if parent_dec_id != 0 else '0'
+        xml_lines.append(
+            f'    <NODE Id="{hex_id}" ParentId="{parent_hex}" '
+            f'Attribute="{attribute}" Timestamp="{ts_ms}" Lib_Type="0" CheckType="0"/>'
+        )
+    xml_lines += ['  </PLAYLISTS>', '</MASTER_PLAYLIST>', '']
+    xml_manifest.write_text('\n'.join(xml_lines), encoding='utf-8')
+
+    usb_con.close()
+
+    if missing_audio:
+        print(f"\n  ⚠️  {len(missing_audio)} audio files not found locally (tracks skipped):")
+        for p in missing_audio[:5]:
+            print(f"      {p}")
+        if len(missing_audio) > 5:
+            print(f"      … and {len(missing_audio)-5} more")
+
+    print(f"\n  USB export complete → {usb_path}")
+    print(f"  exportLibrary.db: {usb_db_path}")
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--usb',       required=True, help='USB mount point, e.g. /Volumes/MYUSB')
+    ap.add_argument('--playlists', nargs='+',     help='Root folder/playlist names to export')
+    ap.add_argument('--all',       action='store_true', help='Export entire library')
+    ap.add_argument('--dry-run',   action='store_true', help='Preview without writing')
+    args = ap.parse_args()
+
+    usb = Path(args.usb)
+    if not usb.exists():
+        raise SystemExit(f"USB path not found: {usb}")
+
+    export_to_usb(usb, args.playlists or [], args.all, args.dry_run)
+
+if __name__ == '__main__':
+    main()

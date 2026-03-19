@@ -1,0 +1,68 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                   AUTO-SAVE QUICK REFERENCE CARD                          ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+PROTECT YOUR WORK — ALWAYS DO THIS BEFORE EDITING:
+
+  1. Snapshot (before risky changes):
+     $ python3.11 traktor_autosave.py --snapshot
+
+  2. Monitor (during long operations):
+     $ python3.11 traktor_autosave.py --watch &
+
+  3. Restore (if something goes wrong):
+     $ cp ~/Documents/.../collection.snapshot_TIMESTAMP.nml collection.nml
+
+═══════════════════════════════════════════════════════════════════════════════
+
+EXPORT FAILED? CHECK THE CHECKPOINT MESSAGE:
+
+  ❌ Export failed: Permission denied
+  ✅ Completed before failure:
+    • Playlist selection
+    • 2,345 audio files copied
+    • Playlists written to DB
+
+  → Your work is preserved up to the checkpoint
+  → Fix the issue and re-run the export
+  → It will skip already-processed files and continue
+
+═══════════════════════════════════════════════════════════════════════════════
+
+AUTO-SAVE IN YOUR WORKFLOW:
+
+  [1] Before starting work:
+      python3.11 traktor_autosave.py --snapshot
+
+  [2] If using USB export:
+      python3.11 traktor_to_usb.py --select
+      (Built-in checkpoints at every step)
+
+  [3] If merging duplicates:
+      python3.11 merge_duplicates.py --auto-exact
+      (Auto-backup created automatically)
+
+  [4] Watch for changes (optional):
+      python3.11 traktor_autosave.py --watch &
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FILE LOCATIONS:
+
+  Current collection:   ~/Documents/Native Instruments/Traktor 3.11.1/collection.nml
+  Snapshots (restore):  collection.snapshot_20260319_143015.nml  (same dir)
+  Pre-merge backups:    collection.nml.bak_20260317_095023       (same dir)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+IF YOU LOST WORK:
+
+  1. Check what backups exist:
+     ls -lh ~/Documents/.../collection*.nml
+
+  2. Restore the most recent:
+     cp ~/Documents/.../collection.snapshot_LATEST.nml collection.nml
+
+  3. Open Traktor — your work is back
+
+═══════════════════════════════════════════════════════════════════════════════

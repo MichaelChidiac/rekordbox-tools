@@ -1,0 +1,110 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    SYNC MASTER — QUICK REFERENCE                          ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+START HERE:
+
+  Easy Mode (Web UI):
+  $ python3.11 sync_web.py
+  → Opens: http://localhost:8080
+  → Click buttons, watch progress
+
+  Advanced (Command Line):
+  $ python3.11 sync_master.py --to-usb --select
+  $ python3.11 sync_master.py --to-rekordbox --all
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYNC TO REKORDBOX (Update master.db from Traktor):
+
+  Sync entire library:
+  $ python3.11 sync_master.py --to-rekordbox --all
+
+  What it does:
+  ✅ Reads Traktor collection.nml
+  ✅ Converts playlists, cues, metadata, beat grids
+  ✅ Updates Rekordbox master.db
+  ✅ Syncs playlist manifest
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYNC TO USB (Export to CDJ-3000/XDJ-RX3/XDJ-XZ):
+
+  Pick playlists (interactive):
+  $ python3.11 sync_master.py --to-usb --select
+
+  Sync entire library:
+  $ python3.11 sync_master.py --to-usb --all
+
+  Sync specific playlists:
+  $ python3.11 sync_master.py --to-usb --playlists "01 Events" "History"
+
+  Fast re-sync (only new tracks):
+  $ python3.11 sync_master.py --to-usb --all --sync
+
+  Preview without writing:
+  $ python3.11 sync_master.py --to-usb --all --dry-run
+
+  Specify USB path:
+  $ python3.11 sync_master.py --to-usb --all --usb /Volumes/MYUSB
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SELECTION MODES:
+
+  --all              Everything in your library
+  --select           Interactive: checkboxes to pick folders
+  --playlists NAME   Specific playlist names
+
+═══════════════════════════════════════════════════════════════════════════════
+
+USB OPTIONS:
+
+  --sync             Incremental sync (only new/changed)
+  --dry-run          Preview without writing
+  --usb PATH         Manual USB path
+
+═══════════════════════════════════════════════════════════════════════════════
+
+COMMON WORKFLOWS:
+
+  Workflow 1: DJ night prep
+  $ python3.11 sync_master.py --to-usb --select
+  → Pick playlists for tonight
+  → Plug USB into CDJ and play!
+
+  Workflow 2: Weekly backup to Rekordbox
+  $ python3.11 sync_master.py --to-rekordbox --all
+  → Syncs your latest Traktor edits
+
+  Workflow 3: Fast USB update (after adding tracks)
+  $ python3.11 sync_master.py --to-usb --all --sync
+  → Only copies new tracks (much faster)
+
+  Workflow 4: Multiple USB drives
+  $ python3.11 sync_master.py --to-usb --all --usb /Volumes/USB1
+  $ python3.11 sync_master.py --to-usb --all --usb /Volumes/USB2
+
+═══════════════════════════════════════════════════════════════════════════════
+
+TROUBLESHOOTING:
+
+  USB not detected?
+  $ python3.11 sync_master.py --to-usb --all --usb /Volumes/MYUSB
+  (specify path manually)
+
+  Permission denied?
+  $ diskutil unmount /Volumes/MYUSB
+  $ diskutil mount /Volumes/MYUSB
+
+  Want to see what would happen?
+  $ python3.11 sync_master.py --to-usb --all --dry-run
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FULL HELP:
+
+  $ python3.11 sync_master.py --help
+  $ cat SYNC_GUIDE.md
+
+═══════════════════════════════════════════════════════════════════════════════
