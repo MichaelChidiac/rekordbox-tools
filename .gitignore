@@ -1,0 +1,28 @@
+# Generated output
+traktor_to_rekordbox.xml
+traktor_to_rekordbox.xml.bak
+traktor_to_usb.py.bak
+
+# Database files (user data)
+fingerprints.db
+master*.db
+master*.db.backup*
+collection.nml.backup*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
