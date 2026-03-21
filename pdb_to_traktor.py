@@ -10,9 +10,14 @@ Always creates a timestamped backup of the NML before modifying it.
 Usage:
     python3.11 pdb_to_traktor.py \\
         --playlist "HISTORY 008" \\
-        --name "HISTORY NYE B2B" \\
+        --name "My Live Set" \\
         --pdb "/Volumes/Extreme SSD/.PIONEER/rekordbox/export.pdb" \\
         --nml ~/Documents/Native\\ Instruments/Traktor\\ 3.11.1/collection.nml
+
+    # --name supports folder paths with / separator:
+    python3.11 pdb_to_traktor.py \\
+        --playlist "HISTORY 008" \\
+        --name "04 - History / Live Events / My Set"
 
     # --name defaults to the playlist name from the PDB if omitted
     # --pdb defaults to the Extreme SSD path if omitted
@@ -106,7 +111,9 @@ process.stdout.write(JSON.stringify({ playlist: target, entries }));
 
 def read_pdb(pdb_path: str, playlist_name: str) -> dict:
     """Use Node.js to parse the PDB and return playlist + entries as a dict."""
-    node = 'node'
+    node = '/usr/local/bin/node'  # Use absolute path for consistent subprocess execution
+    if not Path(node).exists():
+        node = 'node'  # Fallback to PATH lookup
     script_path = TOOLS_DIR / '_reader_tmp.js'
     script_path.write_text(_READER_SCRIPT)
     try:
@@ -166,35 +173,99 @@ def find_key(filename: str, mapping: dict) -> str | None:
     return None
 
 
-def inject_playlist(nml_content: str, playlist_name: str, keys: list[str], playlist_uuid: str) -> str:
+def _find_last_folder(nml_content: str, folder_name: str) -> re.Match | None:
+    """Find the LAST occurrence of a folder node (the original, not duplicates at top)."""
+    matches = list(re.finditer(
+        rf'<NODE TYPE="FOLDER" NAME="{re.escape(folder_name)}"><SUBNODES COUNT="(\d+)">',
+        nml_content
+    ))
+    return matches[-1] if matches else None
+
+
+def _bump_subnodes(nml_content: str, match: re.Match) -> tuple[str, int]:
+    """Increment the SUBNODES COUNT at the given match position. Returns (updated_content, insert_pos)."""
+    old_count = int(match.group(1))
+    new_count = old_count + 1
+    old_tag = match.group(0)
+    new_tag = old_tag.replace(f'COUNT="{old_count}"', f'COUNT="{new_count}"')
+    # Replace only this specific occurrence by position
+    start, end = match.start(), match.end()
+    nml_content = nml_content[:start] + new_tag + nml_content[end:]
+    insert_pos = start + len(new_tag)
+    return nml_content, insert_pos
+
+
+def inject_playlist(nml_content: str, playlist_path: str, keys: list[str], playlist_uuid: str) -> str:
+    """Inject a playlist at the specified path (supports nested folders with /).
+    
+    Finds existing folders by name and inserts into them. Only creates
+    folders that don't already exist.
+    """
     entries_xml = ''.join(
         f'<ENTRY><PRIMARYKEY TYPE="TRACK" KEY="{k.replace("&", "&amp;")}"></PRIMARYKEY></ENTRY>'
         for k in keys
     )
     count = len(keys)
-    node = (
+    
+    parts = [p.strip() for p in playlist_path.split('/')]
+    playlist_name = parts[-1]
+    folder_parts = parts[:-1]
+    
+    playlist_node = (
         f'<NODE TYPE="PLAYLIST" NAME="{playlist_name}">'
         f'<PLAYLIST ENTRIES="{count}" TYPE="LIST" UUID="{playlist_uuid}">'
         f'{entries_xml}'
         f'</PLAYLIST></NODE>'
     )
-
-    # Bump $ROOT SUBNODES count
-    m = re.search(r'NAME="\$ROOT"><SUBNODES COUNT="(\d+)">', nml_content)
-    if not m:
-        raise ValueError('Could not find $ROOT SUBNODES COUNT in NML')
-    old_count = int(m.group(1))
-    new_count = old_count + 1
-    nml_content = nml_content.replace(
-        f'NAME="$ROOT"><SUBNODES COUNT="{old_count}">',
-        f'NAME="$ROOT"><SUBNODES COUNT="{new_count}">',
-        1
-    )
-
-    # Insert as first child of $ROOT
-    marker = f'<SUBNODES COUNT="{new_count}">'
-    pos = nml_content.find(marker) + len(marker)
-    return nml_content[:pos] + node + nml_content[pos:]
+    
+    if not folder_parts:
+        # No folders — insert at $ROOT
+        m = re.search(r'NAME="\$ROOT"><SUBNODES COUNT="(\d+)">', nml_content)
+        if not m:
+            raise ValueError('Could not find $ROOT SUBNODES COUNT in NML')
+        nml_content, insert_pos = _bump_subnodes(nml_content, m)
+        return nml_content[:insert_pos] + playlist_node + nml_content[insert_pos:]
+    
+    # Walk folder path: find existing folders, create missing ones
+    # Find the deepest existing folder
+    deepest_match = None
+    deepest_idx = -1  # index into folder_parts of deepest found folder
+    
+    for i, folder_name in enumerate(folder_parts):
+        m = _find_last_folder(nml_content, folder_name)
+        if m:
+            deepest_match = m
+            deepest_idx = i
+        else:
+            break
+    
+    if deepest_idx == len(folder_parts) - 1:
+        # All folders exist — just insert the playlist into the deepest one
+        nml_content, insert_pos = _bump_subnodes(nml_content, deepest_match)
+        return nml_content[:insert_pos] + playlist_node + nml_content[insert_pos:]
+    
+    # Some folders need to be created. Build the missing folder chain
+    # wrapping the playlist from innermost to outermost missing folder.
+    node_to_insert = playlist_node
+    for i in range(len(folder_parts) - 1, deepest_idx, -1):
+        node_to_insert = (
+            f'<NODE TYPE="FOLDER" NAME="{folder_parts[i]}">'
+            f'<SUBNODES COUNT="1">'
+            f'{node_to_insert}'
+            f'</SUBNODES></NODE>'
+        )
+    
+    if deepest_idx >= 0:
+        # Insert the new folder chain into the deepest existing folder
+        nml_content, insert_pos = _bump_subnodes(nml_content, deepest_match)
+        return nml_content[:insert_pos] + node_to_insert + nml_content[insert_pos:]
+    else:
+        # No folders exist at all — insert everything at $ROOT
+        m = re.search(r'NAME="\$ROOT"><SUBNODES COUNT="(\d+)">', nml_content)
+        if not m:
+            raise ValueError('Could not find $ROOT SUBNODES COUNT in NML')
+        nml_content, insert_pos = _bump_subnodes(nml_content, m)
+        return nml_content[:insert_pos] + node_to_insert + nml_content[insert_pos:]
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -258,9 +329,10 @@ def main():
     with open(nml_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
 
-    # Verify
-    if f'NAME="{playlist_name}"' in new_content:
-        print(f'\n✓ Playlist "{playlist_name}" added at root with {len(keys)} tracks')
+    # Verify — extract just the playlist name from the path for checking
+    check_name = playlist_name.split('/')[-1].strip() if '/' in playlist_name else playlist_name
+    if f'NAME="{check_name}"' in new_content:
+        print(f'\n✓ Playlist "{playlist_name}" added with {len(keys)} tracks')
         print(f'  UUID: {pl_uuid}')
         if missing:
             print(f'\n  {len(missing)} tracks could not be matched (not in Traktor collection):')

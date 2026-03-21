@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import subprocess
+import re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -38,6 +39,9 @@ class SyncHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/status':
             self.send_json(200, {"status": "ready"})
         
+        elif parsed_path.path == '/api/history-playlists':
+            self.list_history_playlists()
+        
         else:
             self.send_response(404)
             self.end_headers()
@@ -55,9 +59,72 @@ class SyncHandler(BaseHTTPRequestHandler):
                 self.send_json(200, result)
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
+        elif parsed_path.path == '/api/import-history':
+            try:
+                data = json.loads(body)
+                result = self.execute_import_history(data)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
         else:
             self.send_response(404)
             self.end_headers()
+    
+    def list_history_playlists(self):
+        """List available history playlists from USB."""
+        node = '/usr/local/bin/node'
+        if not Path(node).exists():
+            node = 'node'
+        try:
+            result = subprocess.run([node, str(TOOLS_DIR / 'read_history.js'), '--list'],
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                playlists = self.parse_playlist_list(result.stdout)
+                self.send_json(200, {"playlists": playlists})
+            else:
+                self.send_json(400, {"error": result.stderr})
+        except Exception as e:
+            self.send_json(400, {"error": str(e)})
+    
+    def parse_playlist_list(self, output: str) -> list:
+        """Parse output from read_history.js --list."""
+        playlists = []
+        for line in output.split('\n'):
+            line = line.strip()
+            if line and line.startswith('['):
+                match = re.match(r'\[(\d+)\]\s+(.*)', line)
+                if match:
+                    playlists.append(match.group(2))
+        return playlists
+    
+    def execute_import_history(self, config):
+        """Execute import history command."""
+        playlist_name = config.get('playlist')
+        traktor_name = config.get('traktor_name')
+        
+        if not playlist_name or not traktor_name:
+            return {"success": False, "error": "Missing playlist_name or traktor_name"}
+        
+        args = [
+            '--playlist', playlist_name,
+            '--name', traktor_name
+        ]
+        
+        cmd = [sys.executable, str(TOOLS_DIR / 'pdb_to_traktor.py')] + args
+        print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            return {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-1000:] if result.stdout else "",
+                "stderr": result.stderr[-1000:] if result.stderr else ""
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Timeout (>1 hour)"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
     
     def execute_sync(self, config):
         """Execute sync command."""
@@ -130,7 +197,7 @@ HTML_TEMPLATE = """
             color: #e8e8e8;
             padding: 40px 20px;
         }
-        .container { max-width: 600px; margin: 0 auto; }
+        .container { max-width: 700px; margin: 0 auto; }
         h1 { font-size: 32px; margin-bottom: 10px; color: #00bcd4; }
         .subtitle { color: #888; margin-bottom: 40px; }
         
@@ -168,6 +235,35 @@ HTML_TEMPLATE = """
         input[type="radio"], input[type="checkbox"] {
             margin-right: 12px;
             cursor: pointer;
+        }
+        
+        input[type="text"], select {
+            width: 100%;
+            padding: 12px;
+            background: #232a33;
+            border: 1px solid #444;
+            border-radius: 6px;
+            color: #e8e8e8;
+            font-family: inherit;
+            font-size: 14px;
+        }
+        
+        input[type="text"]:focus, select:focus {
+            outline: none;
+            border-color: #00bcd4;
+            box-shadow: 0 0 0 3px rgba(0, 188, 212, 0.1);
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            background: none;
+            padding: 0;
+            cursor: default;
         }
         
         .buttons {
@@ -249,6 +345,33 @@ HTML_TEMPLATE = """
             50% { width: 100%; }
             100% { width: 0%; }
         }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .tab-button {
+            padding: 12px 20px;
+            background: none;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-weight: 600;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: all 0.2s;
+        }
+        
+        .tab-button.active {
+            color: #00bcd4;
+            border-bottom-color: #00bcd4;
+        }
+        
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
     </style>
 </head>
 <body>
@@ -256,64 +379,119 @@ HTML_TEMPLATE = """
         <h1>🎚️ Sync Master</h1>
         <p class="subtitle">Traktor ↔ Rekordbox / USB Sync</p>
         
-        <div class="panel">
-            <!-- TARGET -->
-            <div class="section">
-                <div class="section-title">🎯 Where to sync?</div>
-                <div class="option-group">
-                    <label>
-                        <input type="radio" name="target" value="rekordbox" checked>
-                        Rekordbox (master.db)
-                    </label>
-                    <label>
-                        <input type="radio" name="target" value="usb">
-                        Pioneer USB (CDJ-compatible)
-                    </label>
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('sync-tab', this)">📦 Library Sync</button>
+            <button class="tab-button" onclick="switchTab('history-tab', this)">📜 Import History</button>
+        </div>
+        
+        <!-- SYNC TAB -->
+        <div class="tab-content active" id="sync-tab">
+            <div class="panel">
+                <!-- TARGET -->
+                <div class="section">
+                    <div class="section-title">🎯 Where to sync?</div>
+                    <div class="option-group">
+                        <label>
+                            <input type="radio" name="target" value="rekordbox" checked>
+                            Rekordbox (master.db)
+                        </label>
+                        <label>
+                            <input type="radio" name="target" value="usb">
+                            Pioneer USB (CDJ-compatible)
+                        </label>
+                    </div>
                 </div>
-            </div>
-            
-            <!-- SELECTION -->
-            <div class="section">
-                <div class="section-title">📋 What to sync?</div>
-                <div class="option-group">
-                    <label>
-                        <input type="radio" name="selection" value="all" checked>
-                        Entire library
-                    </label>
-                    <label>
-                        <input type="radio" name="selection" value="select">
-                        Pick playlists (interactive)
-                    </label>
+                
+                <!-- SELECTION -->
+                <div class="section">
+                    <div class="section-title">📋 What to sync?</div>
+                    <div class="option-group">
+                        <label>
+                            <input type="radio" name="selection" value="all" checked>
+                            Entire library
+                        </label>
+                        <label>
+                            <input type="radio" name="selection" value="select">
+                            Pick playlists (interactive)
+                        </label>
+                    </div>
                 </div>
-            </div>
-            
-            <!-- USB OPTIONS -->
-            <div class="section" id="usb-options" style="display:none;">
-                <div class="section-title">⚙️ USB Options</div>
-                <div class="option-group">
-                    <label>
-                        <input type="checkbox" id="sync-mode">
-                        Incremental sync (only new/changed)
-                    </label>
-                    <label>
-                        <input type="checkbox" id="dry-run">
-                        Preview only (don't write)
-                    </label>
+                
+                <!-- USB OPTIONS -->
+                <div class="section" id="usb-options" style="display:none;">
+                    <div class="section-title">⚙️ USB Options</div>
+                    <div class="option-group">
+                        <label>
+                            <input type="checkbox" id="sync-mode">
+                            Incremental sync (only new/changed)
+                        </label>
+                        <label>
+                            <input type="checkbox" id="dry-run">
+                            Preview only (don't write)
+                        </label>
+                    </div>
                 </div>
+                
+                <!-- BUTTONS -->
+                <div class="buttons">
+                    <button class="btn-primary" onclick="startSync()">Start Sync</button>
+                    <button class="btn-secondary" onclick="resetForm()">Reset</button>
+                </div>
+                
+                <!-- STATUS -->
+                <div class="status" id="status"></div>
             </div>
-            
-            <!-- BUTTONS -->
-            <div class="buttons">
-                <button class="btn-primary" onclick="startSync()">Start Sync</button>
-                <button class="btn-secondary" onclick="resetForm()">Reset</button>
+        </div>
+        
+        <!-- HISTORY TAB -->
+        <div class="tab-content" id="history-tab">
+            <div class="panel">
+                <div class="section">
+                    <div class="section-title">📜 Import History Playlist</div>
+                    
+                    <div class="form-group">
+                        <label>Select a history playlist from USB:</label>
+                        <select id="history-playlist">
+                            <option value="">Loading playlists...</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Give it a name in Traktor:</label>
+                        <input type="text" id="history-name" value="04 - History / Live Events / " placeholder="e.g., 04 - History / Live Events / My Set">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label style="font-size: 12px; color: #888;">💡 Tip: Use path format for folders, e.g., "04 - History / Live Events / My Set"</label>
+                    </div>
+                </div>
+                
+                <!-- BUTTONS -->
+                <div class="buttons">
+                    <button class="btn-primary" onclick="importHistory()">Import to Traktor</button>
+                    <button class="btn-secondary" onclick="resetHistoryForm()">Reset</button>
+                </div>
+                
+                <!-- STATUS -->
+                <div class="status" id="history-status"></div>
             </div>
-            
-            <!-- STATUS -->
-            <div class="status" id="status"></div>
         </div>
     </div>
     
     <script>
+        // ── TAB SWITCHING ────────────────────────────────────────────────
+        function switchTab(tabId, btn) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            btn.classList.add('active');
+            
+            if (tabId === 'history-tab') {
+                loadHistoryPlaylists();
+            }
+        }
+        
+        // ── SYNC TAB ─────────────────────────────────────────────────────
         const targetRadios = document.querySelectorAll('input[name="target"]');
         const usbOptions = document.getElementById('usb-options');
         
@@ -364,14 +542,83 @@ HTML_TEMPLATE = """
             document.getElementById('status').innerHTML = '';
             usbOptions.style.display = 'none';
         }
+        
+        // ── HISTORY TAB ──────────────────────────────────────────────────
+        function loadHistoryPlaylists() {
+            const select = document.getElementById('history-playlist');
+            select.innerHTML = '<option value="">Loading...</option>';
+            
+            fetch('/api/history-playlists')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.playlists && data.playlists.length > 0) {
+                        select.innerHTML = '<option value="">Choose a playlist...</option>' +
+                            data.playlists.map(p => `<option value="${p}">${p}</option>`).join('');
+                    } else {
+                        select.innerHTML = '<option value="">No playlists found (USB connected?)</option>';
+                    }
+                })
+                .catch(e => {
+                    select.innerHTML = `<option value="">Error loading playlists: ${e.message}</option>`;
+                });
+        }
+        
+        function importHistory() {
+            const playlist = document.getElementById('history-playlist').value;
+            const traktorName = document.getElementById('history-name').value.trim();
+            
+            if (!playlist) {
+                alert('Please select a history playlist');
+                return;
+            }
+            if (!traktorName) {
+                alert('Please enter a name for the Traktor playlist');
+                return;
+            }
+            
+            const config = { playlist, traktor_name: traktorName };
+            const status = document.getElementById('history-status');
+            status.className = 'status loading';
+            status.innerHTML = '<div class="progress"><div class="progress-fill"></div></div>Importing...';
+            
+            fetch('/api/import-history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    status.className = 'status success';
+                    status.innerHTML = '✅ Playlist imported successfully!<br><small>Open Traktor to see the new playlist.</small>';
+                    resetHistoryForm();
+                } else {
+                    status.className = 'status error';
+                    status.innerHTML = '❌ Import failed:<br><small>' + (data.error || data.stderr || '') + '</small>';
+                }
+            })
+            .catch(e => {
+                status.className = 'status error';
+                status.innerHTML = '❌ Error: ' + e.message;
+            });
+        }
+        
+        function resetHistoryForm() {
+            document.getElementById('history-playlist').value = '';
+            document.getElementById('history-name').value = '';
+            document.getElementById('history-status').innerHTML = '';
+        }
     </script>
 </body>
 </html>
 """
 
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
 def main():
     port = 8080
-    server = HTTPServer(('localhost', port), SyncHandler)
+    server = ReusableHTTPServer(('localhost', port), SyncHandler)
     
     print(f"🌐 Sync Master web UI")
     print(f"   Server: http://localhost:{port}")
