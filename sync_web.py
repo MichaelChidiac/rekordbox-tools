@@ -117,6 +117,13 @@ class SyncHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"saved": True})
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
+        elif parsed_path.path == '/api/wipe-usb':
+            try:
+                data = json.loads(body)
+                result = self.execute_wipe(data)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -224,6 +231,27 @@ class SyncHandler(BaseHTTPRequestHandler):
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "error": "Timeout (>1 hour)"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def execute_wipe(self, config):
+        """Wipe all Rekordbox data from USB."""
+        args = ['--wipe']
+        if config.get('usb_path'):
+            args.extend(['--usb', config['usb_path']])
+        if config.get('dry_run'):
+            args.append('--dry-run')
+        
+        cmd = [sys.executable, str(TOOLS_DIR / "traktor_to_usb.py")] + args
+        print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            return {
+                "success": result.returncode == 0,
+                "stdout": result.stdout[-1000:] if result.stdout else "",
+                "stderr": result.stderr[-1000:] if result.stderr else ""
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
     
@@ -713,6 +741,7 @@ HTML_TEMPLATE = """
                 <div class="buttons">
                     <button class="btn-primary" onclick="startSync()">Sync to USB</button>
                     <button class="btn-secondary" onclick="resetForm()">Reset</button>
+                    <button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
                 </div>
                 
                 <!-- STATUS -->
@@ -1415,6 +1444,40 @@ HTML_TEMPLATE = """
             var mirrorInfo = document.getElementById('mirror-info');
             if (mirrorInfo) mirrorInfo.style.display = 'none';
             if (selectionSection) selectionSection.style.display = 'block';
+        }
+        
+        function wipeUsb() {
+            if (!lastUsbPath) {
+                alert('No USB detected. Plug in a Pioneer USB first.');
+                return;
+            }
+            var usbName = lastUsbPath.split('/').pop();
+            if (!confirm('⚠️ This will DELETE all Rekordbox data from ' + usbName + ':\\n\\n• Audio files (Contents/)\\n• Database (exportLibrary.db)\\n• Waveforms & cues (USBANLZ/)\\n\\nAre you sure?')) {
+                return;
+            }
+            var status = document.getElementById('status');
+            status.className = 'status loading';
+            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Wiping USB...';
+            
+            fetch('/api/wipe-usb', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ usb_path: getSelectedUsbPath() })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.success) {
+                    status.className = 'status success';
+                    status.innerHTML = '✅ USB wiped!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
+                } else {
+                    status.className = 'status error';
+                    status.innerHTML = '❌ Wipe failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
+                }
+            })
+            .catch(function(e) {
+                status.className = 'status error';
+                status.innerHTML = '❌ Error: ' + escapeHtml(e.message);
+            });
         }
         
         // ── HISTORY TAB ──────────────────────────────────────────────────

@@ -131,6 +131,56 @@ def detect_pioneer_usbs():
             candidates.append(vol)
     return sorted(candidates)
 
+# ── Wipe USB ───────────────────────────────────────────────────────────────────
+def wipe_usb(usb_path: Path, dry_run: bool = False):
+    """Remove all Rekordbox data from a Pioneer USB (DB, playlists XML, ANLZ, audio)."""
+    usb_rb_dir  = usb_path / PIONEER_DIR / "rekordbox"
+    usb_anlz    = usb_path / PIONEER_DIR / "USBANLZ"
+    audio_dir   = usb_path / AUDIO_DIR
+
+    targets = []
+    for d in [usb_rb_dir, usb_anlz, audio_dir]:
+        if d.exists():
+            size = sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
+            count = sum(1 for f in d.rglob('*') if f.is_file())
+            targets.append((d, count, size))
+
+    if not targets:
+        print("Nothing to wipe — USB appears clean.")
+        return True
+
+    print(f"\n🗑️  Wipe USB: {usb_path.name}")
+    total_files = 0
+    total_bytes = 0
+    for d, count, size in targets:
+        mb = size / (1024 * 1024)
+        print(f"  {d.relative_to(usb_path)}: {count} files ({mb:.1f} MB)")
+        total_files += count
+        total_bytes += size
+
+    print(f"  Total: {total_files} files ({total_bytes / (1024*1024):.1f} MB)")
+
+    if dry_run:
+        print("\n📋 DRY RUN — nothing deleted.")
+        return True
+
+    import shutil
+    for d, _, _ in targets:
+        shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"  ✅ Wiped {d.relative_to(usb_path)}/")
+
+    # Recreate empty DB structure so next export starts clean
+    usb_db_path = usb_rb_dir / "exportLibrary.db"
+    if not usb_db_path.exists():
+        con = open_db(usb_db_path)
+        con.executescript(SCHEMA_SQL)
+        con.commit()
+        con.close()
+
+    print(f"\n✅ USB wiped. Ready for fresh export.")
+    return True
+
 # ── Schema ─────────────────────────────────────────────────────────────────────
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS djmdContent (
@@ -854,6 +904,8 @@ def main():
     ap.add_argument('--dry-run',  action='store_true', help='Preview without writing')
     ap.add_argument('--fetch-nas', action='store_true',
                     help='Fetch missing tracks from NAS via traktor-ml (requires server + SSH tunnel)')
+    ap.add_argument('--wipe',     action='store_true',
+                    help='Wipe all Rekordbox data from USB (DB, playlists, audio, ANLZ)')
     args = ap.parse_args()
 
     # Resolve sync mode
@@ -909,6 +961,11 @@ def main():
                 test_file.unlink()
             except OSError as e:
                 ap.error(f"USB is read-only or not writable: {e}")
+
+        # ── Wipe mode (early exit) ───────────────────────────────────────────────
+        if args.wipe:
+            wipe_usb(usb_path, args.dry_run)
+            sys.exit(0)
 
         # ── Load playlist tree from master.db ────────────────────────────────────
         master = open_db(MASTER_DB)
