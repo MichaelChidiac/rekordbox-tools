@@ -254,9 +254,15 @@ class SyncHandler(BaseHTTPRequestHandler):
                 nodes = []
                 for row_id, name, attr in rows:
                     if attr == 1:  # folder
+                        children = build_tree(row_id)
+                        total_tracks = sum(
+                            n["track_count"] if n["type"] == "playlist"
+                            else n.get("total_tracks", 0)
+                            for n in children
+                        )
                         nodes.append({
                             "id": row_id, "name": name, "type": "folder",
-                            "children": build_tree(row_id)
+                            "children": children, "total_tracks": total_tracks
                         })
                     else:  # playlist
                         count = con.execute(
@@ -476,11 +482,11 @@ HTML_TEMPLATE = """
         .tab-content { display: none; }
         .tab-content.active { display: block; }
         
-        .tree-folder {
-            cursor: pointer; font-weight: bold; padding: 4px 0;
-            user-select: none;
+        .tree-folder-row {
+            display: flex; align-items: center; gap: 6px;
+            padding: 4px 2px; user-select: none;
         }
-        .tree-folder:hover { color: #4fc3f7; }
+        .tree-folder-row:hover { background: rgba(79,195,247,0.05); border-radius: 4px; }
         .tree-children { padding-left: 20px; }
         .tree-children.collapsed { display: none; }
         .tree-playlist {
@@ -501,7 +507,10 @@ HTML_TEMPLATE = """
         .pinned-highlight {
             background: rgba(79,195,247,0.1); border-radius: 4px; padding: 2px 4px;
         }
-        .folder-arrow { display: inline-block; width: 16px; }
+        .folder-arrow { display: inline-block; width: 16px; cursor: pointer; flex-shrink: 0; }
+        .folder-name { font-weight: bold; cursor: pointer; flex: 1; }
+        .folder-name:hover { color: #4fc3f7; }
+        .tree-folder-cb { cursor: pointer; flex-shrink: 0; }
         .usb-status {
             padding: 8px 12px; border-radius: 8px; margin-bottom: 12px;
             font-size: 0.9em; display: flex; align-items: center; gap: 8px;
@@ -720,40 +729,103 @@ HTML_TEMPLATE = """
         function renderTree(nodes, container) {
             nodes.forEach(function(node) {
                 if (node.type === 'folder') {
+                    var isPinned = pinnedPlaylists.has(node.id);
                     var folderDiv = document.createElement('div');
+                    folderDiv.className = 'tree-folder-item';
+
                     var header = document.createElement('div');
-                    header.className = 'tree-folder';
-                    header.innerHTML = '<span class="folder-arrow">▶</span> 📁 ' + escapeHtml(node.name);
-                    header.addEventListener('click', function() { toggleFolder(header); });
-                    folderDiv.appendChild(header);
-                    
+                    header.className = 'tree-folder-row' + (isPinned ? ' pinned-highlight' : '');
+
+                    // ▶ Arrow — only toggles expand/collapse
+                    var arrow = document.createElement('span');
+                    arrow.className = 'folder-arrow';
+                    arrow.textContent = '▶';
+
+                    // Checkbox for folder selection
+                    var cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.className = 'tree-folder-cb';
+                    cb.value = node.name;
+                    cb.dataset.id = node.id;
+                    cb.dataset.type = 'folder';
+                    if (isPinned) cb.checked = true;
+
+                    // 📁 Label — only toggles expand/collapse
+                    var lbl = document.createElement('span');
+                    lbl.className = 'folder-name';
+                    lbl.textContent = '📁 ' + node.name;
+
+                    var count = document.createElement('span');
+                    count.className = 'tree-count';
+                    count.textContent = '(' + (node.total_tracks || 0) + ')';
+
+                    var pin = document.createElement('span');
+                    pin.className = 'pin-btn' + (isPinned ? ' pinned' : '');
+                    pin.title = 'Pin for auto-sync';
+                    pin.textContent = '📌';
+
+                    header.appendChild(arrow);
+                    header.appendChild(cb);
+                    header.appendChild(lbl);
+                    header.appendChild(count);
+                    header.appendChild(pin);
+
                     var children = document.createElement('div');
                     children.className = 'tree-children collapsed';
                     renderTree(node.children || [], children);
+
+                    folderDiv.appendChild(header);
                     folderDiv.appendChild(children);
                     container.appendChild(folderDiv);
+
+                    // Arrow click → toggle expand/collapse only
+                    arrow.addEventListener('click', function() {
+                        children.classList.toggle('collapsed');
+                        arrow.textContent = children.classList.contains('collapsed') ? '▶' : '▼';
+                    });
+                    // Label click → toggle expand/collapse only
+                    lbl.addEventListener('click', function() {
+                        children.classList.toggle('collapsed');
+                        arrow.textContent = children.classList.contains('collapsed') ? '▶' : '▼';
+                    });
+                    // Folder checkbox → propagate to all children; update ancestors
+                    cb.addEventListener('change', function() {
+                        setSubtreeChecked(children, cb.checked);
+                        updateAncestorFolderStates(cb);
+                    });
+                    // Pin button
+                    (function(pinEl, nodeId, cbEl, rowEl) {
+                        pinEl.addEventListener('click', function() {
+                            togglePin(pinEl, nodeId, cbEl, rowEl);
+                        });
+                    })(pin, node.id, cb, header);
+
                 } else {
                     var div = document.createElement('div');
                     var isPinned = pinnedPlaylists.has(node.id);
                     div.className = 'tree-playlist' + (isPinned ? ' pinned-highlight' : '');
-                    
+
                     var cb = document.createElement('input');
                     cb.type = 'checkbox';
                     cb.value = node.name;
                     cb.dataset.id = node.id;
                     if (isPinned) cb.checked = true;
-                    
+                    cb.addEventListener('change', function() {
+                        updateAncestorFolderStates(cb);
+                    });
+
                     var lbl = document.createElement('label');
                     lbl.textContent = node.name;
                     lbl.addEventListener('click', function(evt) {
                         evt.preventDefault();
                         cb.checked = !cb.checked;
+                        updateAncestorFolderStates(cb);
                     });
-                    
+
                     var count = document.createElement('span');
                     count.className = 'tree-count';
                     count.textContent = '(' + node.track_count + ')';
-                    
+
                     var pin = document.createElement('span');
                     pin.className = 'pin-btn' + (isPinned ? ' pinned' : '');
                     pin.title = 'Pin for auto-sync';
@@ -763,7 +835,7 @@ HTML_TEMPLATE = """
                             togglePin(pinEl, nodeId, cbEl, rowDiv);
                         });
                     })(pin, node.id, cb, div);
-                    
+
                     div.appendChild(cb);
                     div.appendChild(lbl);
                     div.appendChild(count);
@@ -779,6 +851,51 @@ HTML_TEMPLATE = """
             children.classList.toggle('collapsed');
             arrow.textContent = children.classList.contains('collapsed') ? '▶' : '▼';
         }
+
+        // ── SUBTREE HELPERS ──────────────────────────────────────────────
+        // Check/uncheck every checkbox inside a .tree-children container.
+        function setSubtreeChecked(container, checked) {
+            container.querySelectorAll('input[type="checkbox"]').forEach(function(c) {
+                c.checked = checked;
+                c.indeterminate = false;
+            });
+        }
+
+        // After any checkbox change, walk UP through .tree-children containers
+        // and set each ancestor folder checkbox to checked / indeterminate / unchecked.
+        function updateAncestorFolderStates(startCb) {
+            var el = startCb.closest('.tree-children');
+            while (el) {
+                var folderRow = el.previousElementSibling;
+                if (!folderRow || !folderRow.classList.contains('tree-folder-row')) break;
+                var folderCb = folderRow.querySelector('input[type="checkbox"][data-type="folder"]');
+                if (!folderCb) break;
+
+                // Collect DIRECT child checkboxes only (playlists + sub-folder roots)
+                var childCbs = Array.from(el.querySelectorAll(
+                    ':scope > .tree-playlist > input[type="checkbox"], ' +
+                    ':scope > .tree-folder-item > .tree-folder-row > input[type="checkbox"][data-type="folder"]'
+                ));
+
+                var total       = childCbs.length;
+                var checkedCnt  = childCbs.filter(function(c) { return c.checked && !c.indeterminate; }).length;
+                var indetermCnt = childCbs.filter(function(c) { return c.indeterminate; }).length;
+
+                if (total === 0 || (checkedCnt === 0 && indetermCnt === 0)) {
+                    folderCb.checked = false;
+                    folderCb.indeterminate = false;
+                } else if (checkedCnt === total) {
+                    folderCb.checked = true;
+                    folderCb.indeterminate = false;
+                } else {
+                    folderCb.checked = false;
+                    folderCb.indeterminate = true;
+                }
+
+                // Climb to the next ancestor level
+                el = folderRow.closest('.tree-children');
+            }
+        }
         
         function togglePin(el, id, cb, row) {
             if (pinnedPlaylists.has(id)) {
@@ -791,6 +908,7 @@ HTML_TEMPLATE = """
                 row.classList.add('pinned-highlight');
                 cb.checked = true;
             }
+            updateAncestorFolderStates(cb);
             savePinnedConfig();
             updateUsbAutoSyncButton();
         }
@@ -803,17 +921,60 @@ HTML_TEMPLATE = """
             }).catch(function() {});
         }
         
+        // Returns the minimal flat list of names for the pinned-IDs set.
+        // Pinned FOLDER  → push folder name (backend resolves recursively).
+        // Pinned PLAYLIST → push playlist name only if no ancestor folder is also pinned.
         function findPlaylistNames(nodes, ids) {
             var names = [];
-            for (var i = 0; i < nodes.length; i++) {
-                var node = nodes[i];
-                if (node.type === 'playlist' && ids.has(node.id)) {
-                    names.push(node.name);
-                }
-                if (node.children) {
-                    names = names.concat(findPlaylistNames(node.children, ids));
+            function walk(ns, ancestorFolderPinned) {
+                for (var i = 0; i < ns.length; i++) {
+                    var node = ns[i];
+                    if (node.type === 'folder') {
+                        if (ids.has(node.id)) {
+                            names.push(node.name);   // whole folder → single entry
+                        } else {
+                            walk(node.children || [], false);
+                        }
+                    } else {
+                        // playlist — only add if its own ID is pinned
+                        // (ancestor folder pinned is already handled above)
+                        if (ids.has(node.id) && !ancestorFolderPinned) {
+                            names.push(node.name);
+                        }
+                    }
                 }
             }
+            walk(nodes, false);
+            return names;
+        }
+
+        // Returns the minimal flat list of names from the CHECKED checkboxes in
+        // the tree UI.  A checked folder adds its name and skips its children
+        // (avoids redundancy, e.g. both "04 - History" AND "- AS").
+        function getCheckedSelectionNames() {
+            var names = [];
+            function walkEl(container) {
+                Array.from(container.children).forEach(function(child) {
+                    if (child.classList.contains('tree-folder-item')) {
+                        var folderRow = child.querySelector(':scope > .tree-folder-row');
+                        var folderCb  = folderRow
+                            ? folderRow.querySelector('input[type="checkbox"][data-type="folder"]')
+                            : null;
+                        if (folderCb && folderCb.checked && !folderCb.indeterminate) {
+                            // Whole folder checked → one entry, skip children
+                            names.push(folderCb.value);
+                        } else {
+                            // Partial / unchecked folder → recurse into children
+                            var childrenContainer = child.querySelector(':scope > .tree-children');
+                            if (childrenContainer) walkEl(childrenContainer);
+                        }
+                    } else if (child.classList.contains('tree-playlist')) {
+                        var cb = child.querySelector('input[type="checkbox"]');
+                        if (cb && cb.checked) names.push(cb.value);
+                    }
+                });
+            }
+            walkEl(document.getElementById('playlist-tree'));
             return names;
         }
         
@@ -929,10 +1090,9 @@ HTML_TEMPLATE = """
             var config = { target: target, selection: selection, sync_mode: syncMode, dry_run: dryRun, fetch_nas: fetchNas };
             
             if (selection === 'playlists') {
-                var checked = document.querySelectorAll('#playlist-tree input[type="checkbox"]:checked');
-                var names = Array.from(checked).map(function(cb) { return cb.value; });
+                var names = getCheckedSelectionNames();
                 if (names.length === 0) {
-                    alert('Please select at least one playlist');
+                    alert('Please select at least one playlist or folder');
                     return;
                 }
                 config.playlists = names;
