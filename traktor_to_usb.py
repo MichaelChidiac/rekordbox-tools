@@ -141,8 +141,15 @@ def wipe_usb(usb_path: Path, dry_run: bool = False):
     targets = []
     for d in [usb_rb_dir, usb_anlz, audio_dir]:
         if d.exists():
-            size = sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
-            count = sum(1 for f in d.rglob('*') if f.is_file())
+            size = 0
+            count = 0
+            for f in d.rglob('*'):
+                try:
+                    if f.is_file():
+                        size += f.stat().st_size
+                        count += 1
+                except OSError:
+                    pass
             targets.append((d, count, size))
 
     if not targets:
@@ -166,7 +173,7 @@ def wipe_usb(usb_path: Path, dry_run: bool = False):
 
     import shutil
     for d, _, _ in targets:
-        shutil.rmtree(d)
+        shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
         print(f"  ✅ Wiped {d.relative_to(usb_path)}/")
 
