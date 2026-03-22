@@ -634,10 +634,10 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h1>🎚️ Sync Master</h1>
-        <p class="subtitle">Traktor ↔ Rekordbox / USB Sync</p>
+        <p class="subtitle">Traktor → USB / Rekordbox Sync</p>
         
         <div class="tabs">
-            <button class="tab-button active" onclick="switchTab('sync-tab', this)">📦 Library Sync</button>
+            <button class="tab-button active" onclick="switchTab('sync-tab', this)">💾 USB Sync</button>
             <button class="tab-button" onclick="switchTab('traktor-tab', this)">🎵 Traktor → Rekordbox</button>
             <button class="tab-button" onclick="switchTab('history-tab', this)">📜 Import History</button>
         </div>
@@ -648,21 +648,6 @@ HTML_TEMPLATE = """
                 <!-- USB STATUS -->
                 <div id="usb-status" class="usb-status usb-disconnected">
                     💾 Checking USB...
-                </div>
-                
-                <!-- TARGET -->
-                <div class="section">
-                    <div class="section-title">🎯 Where to sync?</div>
-                    <div class="option-group">
-                        <label>
-                            <input type="radio" name="target" value="rekordbox" checked>
-                            Rekordbox (master.db)
-                        </label>
-                        <label>
-                            <input type="radio" name="target" value="usb">
-                            Pioneer USB (CDJ-compatible)
-                        </label>
-                    </div>
                 </div>
                 
                 <!-- SELECTION -->
@@ -683,8 +668,8 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 
-                <!-- USB SYNC MODE -->
-                <div class="section" id="usb-options" style="display:none;">
+                <!-- SYNC MODE -->
+                <div class="section" id="usb-options">
                     <div class="section-title">🔄 Sync Mode</div>
                     <div class="option-group">
                         <label title="Push everything, skip existing audio, clean up deleted tracks">
@@ -700,7 +685,14 @@ HTML_TEMPLATE = """
                             Mirror pinned — exact sync of pinned playlists
                         </label>
                     </div>
-                    <div class="section-title" style="margin-top:12px;">⚙️ Options</div>
+                    <div id="mirror-info" style="display:none; margin-top:8px; padding:8px 12px; background:#1a2a1a; border:1px solid #2d5a2d; border-radius:6px; font-size:0.85em; color:#8abb8a;">
+                        ⚡ Mirror mode uses your pinned playlists. Pin playlists using the 📌 icon in the tree below.
+                    </div>
+                </div>
+
+                <!-- OPTIONS -->
+                <div class="section">
+                    <div class="section-title">⚙️ Options</div>
                     <div class="option-group">
                         <label>
                             <input type="checkbox" id="dry-run">
@@ -710,11 +702,6 @@ HTML_TEMPLATE = """
                             <input type="checkbox" id="fetch-nas">
                             <span id="fetch-nas-label">🌐 Fetch missing tracks from NAS</span>
                         </label>
-                    </div>
-                    <div id="mirror-info" style="display:none; margin-top:8px; padding:8px 12px; background:#1a2a1a; border:1px solid #2d5a2d; border-radius:6px; font-size:0.85em; color:#8abb8a;">
-                        ⚡ Mirror mode uses your pinned playlists. Pin playlists using the 📌 icon in the tree below.
-                    </div>
-                    <div class="option-group" style="margin-top:8px;">
                         <label title="Automatically mirror pinned playlists when a USB is plugged in">
                             <input type="checkbox" id="auto-mirror-toggle">
                             Auto-mirror on USB plug-in
@@ -724,7 +711,7 @@ HTML_TEMPLATE = """
                 
                 <!-- BUTTONS -->
                 <div class="buttons">
-                    <button class="btn-primary" onclick="startSync()">Start Sync</button>
+                    <button class="btn-primary" onclick="startSync()">Sync to USB</button>
                     <button class="btn-secondary" onclick="resetForm()">Reset</button>
                 </div>
                 
@@ -736,10 +723,11 @@ HTML_TEMPLATE = """
         <!-- TRAKTOR → REKORDBOX TAB -->
         <div class="tab-content" id="traktor-tab">
             <div class="panel">
+                <!-- SELECTION -->
                 <div class="section">
-                    <div class="section-title">🎵 Sync Traktor Playlists → Rekordbox</div>
-                    <p style="color:#888; font-size:0.9em; margin:0 0 16px 0;">
-                        Reads your Traktor collection directly and writes to Rekordbox's master.db — no need to open Rekordbox or import an XML file.
+                    <div class="section-title">📋 What to sync?</div>
+                    <p style="color:#888; font-size:0.85em; margin:0 0 12px 0;">
+                        Reads your Traktor collection directly and writes to Rekordbox's master.db.
                         Smartlists (⚡) are evaluated and synced as regular playlists.
                     </p>
                     <div class="option-group">
@@ -757,6 +745,7 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
+                <!-- OPTIONS -->
                 <div class="section">
                     <div class="section-title">⚙️ Options</div>
                     <div class="option-group">
@@ -767,11 +756,13 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
+                <!-- BUTTONS -->
                 <div class="buttons">
                     <button class="btn-primary" onclick="startTraktorSync()">Sync to Rekordbox</button>
                     <button class="btn-secondary" onclick="resetTraktorForm()">Reset</button>
                 </div>
 
+                <!-- STATUS -->
                 <div class="status" id="traktor-status"></div>
             </div>
         </div>
@@ -836,16 +827,8 @@ HTML_TEMPLATE = """
         }
         
         // ── SYNC TAB ─────────────────────────────────────────────────────
-        var targetRadios = document.querySelectorAll('input[name="target"]');
         var selectionRadios = document.querySelectorAll('input[name="selection"]');
-        var usbOptions = document.getElementById('usb-options');
         var playlistTree = document.getElementById('playlist-tree');
-        
-        targetRadios.forEach(function(r) {
-            r.addEventListener('change', function() {
-                usbOptions.style.display = r.value === 'usb' ? 'block' : 'none';
-            });
-        });
         
         selectionRadios.forEach(function(r) {
             r.addEventListener('change', function() {
@@ -860,7 +843,7 @@ HTML_TEMPLATE = """
         // Sync mode radio handler
         var syncModeRadios = document.querySelectorAll('input[name="sync-mode"]');
         var mirrorInfo = document.getElementById('mirror-info');
-        var selectionSection = document.querySelector('#sync-tab .section:nth-child(3)');
+        var selectionSection = document.querySelector('#sync-tab .section:nth-child(2)');
         
         syncModeRadios.forEach(function(r) {
             r.addEventListener('change', function() {
@@ -1369,17 +1352,13 @@ HTML_TEMPLATE = """
         
         // ── SYNC ─────────────────────────────────────────────────────────
         function startSync() {
-            var target = document.querySelector('input[name="target"]:checked').value;
             var selection = document.querySelector('input[name="selection"]:checked').value;
             var syncModeRadio = document.querySelector('input[name="sync-mode"]:checked');
             var mode = syncModeRadio ? syncModeRadio.value : 'update';
             var dryRun = document.getElementById('dry-run').checked;
             var fetchNas = document.getElementById('fetch-nas').checked;
             
-            var config = { target: target, selection: selection, mode: mode, dry_run: dryRun, fetch_nas: fetchNas };
-            if (target === 'usb') {
-                config.usb_path = getSelectedUsbPath();
-            }
+            var config = { target: 'usb', selection: selection, mode: mode, dry_run: dryRun, fetch_nas: fetchNas, usb_path: getSelectedUsbPath() };
             
             // Mirror mode uses pinned playlists
             if (mode === 'mirror') {
@@ -1425,7 +1404,6 @@ HTML_TEMPLATE = """
         }
         
         function resetForm() {
-            document.querySelector('input[name="target"][value="rekordbox"]').checked = true;
             document.querySelector('input[name="selection"][value="all"]').checked = true;
             var updateRadio = document.querySelector('input[name="sync-mode"][value="update"]');
             if (updateRadio) updateRadio.checked = true;
@@ -1433,10 +1411,10 @@ HTML_TEMPLATE = """
             document.getElementById('fetch-nas').checked = false;
             document.getElementById('status').className = 'status';
             document.getElementById('status').innerHTML = '';
-            usbOptions.style.display = 'none';
             playlistTree.style.display = 'none';
             var mirrorInfo = document.getElementById('mirror-info');
             if (mirrorInfo) mirrorInfo.style.display = 'none';
+            if (selectionSection) selectionSection.style.display = 'block';
         }
         
         // ── HISTORY TAB ──────────────────────────────────────────────────
