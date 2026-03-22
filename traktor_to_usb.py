@@ -311,7 +311,7 @@ def run_selector(tree) -> list:
     return selected  # list of pl_id strings
 
 # ── Core export ────────────────────────────────────────────────────────────────
-def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool, dry_run: bool):
+def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool, dry_run: bool, fetch_nas: bool = False):
     usb_rb_dir  = usb_path / PIONEER_DIR / "rekordbox"
     usb_anlz    = usb_path / PIONEER_DIR / "USBANLZ"
     usb_audio   = usb_path / AUDIO_DIR
@@ -406,8 +406,51 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
 
     master.close()
 
+    # ── NAS lookup for missing tracks ──────────────────────────────────────────
+    nas_available = {}
+    if fetch_nas:
+        try:
+            from nas_lookup import lookup_nas_tracks, check_traktor_ml_reachable, TRAKTOR_ML_API
+            # Collect paths of all tracks to check which are missing locally
+            missing_paths = []
+            for cid, row in tracks.items():
+                folder_path = row[1]
+                if folder_path and not Path(folder_path).exists():
+                    missing_paths.append(folder_path)
+            if missing_paths:
+                nas_available = lookup_nas_tracks(missing_paths)
+                nas_reachable = check_traktor_ml_reachable()
+                if nas_available and not nas_reachable:
+                    print(f"  ⚠️  {len(nas_available)} tracks found on NAS but traktor-ml API is unreachable")
+                    print(f"      Start the server and SSH tunnel to fetch them")
+                    nas_available = {}
+                elif nas_available:
+                    total_size = sum(t.size_bytes for t in nas_available.values())
+                    print(f"  🌐 NAS: {len(nas_available)} tracks available ({total_size / 1_048_576:.0f} MB)")
+        except ImportError:
+            print("  ⚠️  nas_lookup.py not found — --fetch-nas disabled")
+            fetch_nas = False
+
     if dry_run:
-        print(f"\n  Would copy {len(tracks)} audio files")
+        # Count local vs NAS vs truly missing
+        local_count = 0
+        nas_count = len(nas_available)
+        truly_missing = 0
+        for cid, row in tracks.items():
+            folder_path = row[1]
+            if folder_path and Path(folder_path).exists():
+                local_count += 1
+            elif folder_path and folder_path in nas_available:
+                pass  # already counted in nas_count
+            else:
+                truly_missing += 1
+
+        print(f"\n  Would copy {local_count} local audio files")
+        if fetch_nas and nas_count > 0:
+            total_nas_size = sum(t.size_bytes for t in nas_available.values())
+            print(f"  Would fetch {nas_count} tracks from NAS ({total_nas_size / 1_048_576:.0f} MB)")
+        if truly_missing > 0:
+            print(f"  ⚠️  {truly_missing} tracks unavailable (not local or NAS)")
         print(f"  Would copy {sum(len(v) for v in anlz_map.values())} ANLZ files")
         if deleted_ids:
             print(f"  Would remove {len(deleted_ids)} deleted tracks from DB")
@@ -454,6 +497,8 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
     skipped_audio = 0
     copied_anlz  = 0
     missing_audio = []
+    fetched_from_nas = 0
+    nas_fetch_failed = 0
 
     total = len(tracks)
     for i, (cid, row) in enumerate(tracks.items(), 1):
@@ -464,23 +509,44 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
          bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name) = row
 
         # Audio
+        artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
         src_audio = Path(folder_path) if folder_path else None
-        if not (src_audio and src_audio.exists()):
-            # Skip missing tracks entirely — don't add to database
+        got_audio = False
+
+        if src_audio and src_audio.exists():
+            # File exists locally — copy to USB
+            dst_dir = usb_audio / artist_slug
+            dst_dir.mkdir(exist_ok=True)
+            dst_audio = dst_dir / filename
+            if not dst_audio.exists():
+                shutil.copy2(src_audio, dst_audio)
+                copied_audio += 1
+            else:
+                skipped_audio += 1
+            got_audio = True
+
+        elif fetch_nas and folder_path and folder_path in nas_available:
+            # File missing locally but available on NAS — download to USB
+            from nas_lookup import download_from_nas, TRAKTOR_ML_API
+            dst_dir = usb_audio / artist_slug
+            dst_dir.mkdir(exist_ok=True)
+            dst_audio = dst_dir / filename
+            if dst_audio.exists():
+                skipped_audio += 1
+                got_audio = True
+            else:
+                nas_info = nas_available[folder_path]
+                if download_from_nas(folder_path, dst_audio, TRAKTOR_ML_API, nas_info.file_hash):
+                    fetched_from_nas += 1
+                    got_audio = True
+                else:
+                    nas_fetch_failed += 1
+
+        if not got_audio:
             if folder_path:
                 missing_audio.append(folder_path)
             continue
 
-        # File exists — proceed with export
-        artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
-        dst_dir = usb_audio / artist_slug
-        dst_dir.mkdir(exist_ok=True)
-        dst_audio = dst_dir / filename
-        if not dst_audio.exists():
-            shutil.copy2(src_audio, dst_audio)
-            copied_audio += 1
-        else:
-            skipped_audio += 1
         usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
 
         # ANLZ
@@ -530,7 +596,9 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
 
     print()  # newline after progress
     usb_con.commit()
-    print(f"  ✅ Audio:  {copied_audio} new, {skipped_audio} already present, {len(missing_audio)} missing")
+    print(f"  ✅ Audio:  {copied_audio} local, {skipped_audio} already present, {len(missing_audio)} missing")
+    if fetch_nas:
+        print(f"  🌐 NAS:   {fetched_from_nas} fetched, {nas_fetch_failed} failed")
     print(f"  ✅ ANLZ:   {copied_anlz} new files")
 
     # ── Rebuild playlist structure (always full — fast, no audio I/O) ─────────
@@ -650,6 +718,8 @@ def main():
     ap.add_argument('--sync',     action='store_true',
                     help='Incremental sync: only process new/changed tracks')
     ap.add_argument('--dry-run',  action='store_true', help='Preview without writing')
+    ap.add_argument('--fetch-nas', action='store_true',
+                    help='Fetch missing tracks from NAS via traktor-ml (requires server + SSH tunnel)')
     args = ap.parse_args()
 
     try:
@@ -732,7 +802,7 @@ def main():
                 ap.print_help()
                 sys.exit(1)
 
-        export_to_usb(usb_path, playlist_ids, tree, args.sync, args.dry_run)
+        export_to_usb(usb_path, playlist_ids, tree, args.sync, args.dry_run, args.fetch_nas)
         print("\n✅ Export completed successfully")
 
     except Exception as e:

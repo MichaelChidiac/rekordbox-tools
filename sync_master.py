@@ -102,7 +102,7 @@ def sync_to_rekordbox(all_lib=False, playlists=None, dry_run=False):
     return True
 
 def sync_to_usb(all_lib=False, select=False, playlists=None, usb_path=None, 
-                sync_mode=False, dry_run=False):
+                sync_mode=False, dry_run=False, fetch_nas=False):
     """Sync to USB (CDJ-compatible export)."""
     args = []
     
@@ -123,6 +123,9 @@ def sync_to_usb(all_lib=False, select=False, playlists=None, usb_path=None,
     
     if dry_run:
         args.append("--dry-run")
+    
+    if fetch_nas:
+        args.append("--fetch-nas")
     
     if not run_tool(TRAKTOR_TO_USB, args, "Exporting to USB (CDJ-compatible)"):
         return False
@@ -159,6 +162,8 @@ def main():
                     help='Incremental sync (only new/changed tracks)')
     ap.add_argument('--dry-run', action='store_true',
                     help='Preview without writing')
+    ap.add_argument('--fetch-nas', action='store_true',
+                    help='Fetch missing tracks from NAS via traktor-ml')
     
     args = ap.parse_args()
     
@@ -181,7 +186,8 @@ def main():
             playlists=args.playlists,
             usb_path=args.usb,
             sync_mode=args.sync,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            fetch_nas=args.fetch_nas
         )
     
     sys.exit(0 if success else 1)

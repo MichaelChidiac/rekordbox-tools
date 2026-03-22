@@ -42,6 +42,19 @@ class SyncHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/history-playlists':
             self.list_history_playlists()
         
+        elif parsed_path.path == '/api/nas-status':
+            try:
+                from nas_lookup import check_traktor_ml_reachable, lookup_nas_tracks, TRAKTOR_ML_DB
+                db_exists = TRAKTOR_ML_DB.exists()
+                api_reachable = check_traktor_ml_reachable() if db_exists else False
+                self.send_json(200, {
+                    "available": db_exists and api_reachable,
+                    "db_found": db_exists,
+                    "api_reachable": api_reachable
+                })
+            except ImportError:
+                self.send_json(200, {"available": False, "db_found": False, "api_reachable": False})
+        
         else:
             self.send_response(404)
             self.end_headers()
@@ -153,6 +166,8 @@ class SyncHandler(BaseHTTPRequestHandler):
             args.append('--sync')
         if config.get('dry_run'):
             args.append('--dry-run')
+        if config.get('fetch_nas'):
+            args.append('--fetch-nas')
         
         # Run
         cmd = [sys.executable, str(SYNC_MASTER)] + args
@@ -429,6 +444,10 @@ HTML_TEMPLATE = """
                             <input type="checkbox" id="dry-run">
                             Preview only (don't write)
                         </label>
+                        <label>
+                            <input type="checkbox" id="fetch-nas">
+                            <span id="fetch-nas-label">🌐 Fetch missing tracks from NAS</span>
+                        </label>
                     </div>
                 </div>
                 
@@ -501,13 +520,31 @@ HTML_TEMPLATE = """
             });
         });
         
+        // Check NAS availability on load
+        fetch('/api/nas-status')
+            .then(r => r.json())
+            .then(data => {
+                const cb = document.getElementById('fetch-nas');
+                const label = document.getElementById('fetch-nas-label');
+                if (!data.available) {
+                    cb.disabled = true;
+                    label.style.opacity = '0.5';
+                    label.title = data.db_found
+                        ? 'traktor-ml server not running (start it + SSH tunnel)'
+                        : 'traktor-ml database not found';
+                    label.textContent = '🌐 Fetch from NAS (unavailable)';
+                }
+            })
+            .catch(() => {});
+        
         function startSync() {
             const target = document.querySelector('input[name="target"]:checked').value;
             const selection = document.querySelector('input[name="selection"]:checked').value;
             const syncMode = document.getElementById('sync-mode').checked;
             const dryRun = document.getElementById('dry-run').checked;
+            const fetchNas = document.getElementById('fetch-nas').checked;
             
-            const config = { target, selection, sync_mode: syncMode, dry_run: dryRun };
+            const config = { target, selection, sync_mode: syncMode, dry_run: dryRun, fetch_nas: fetchNas };
             
             const status = document.getElementById('status');
             status.className = 'status loading';
@@ -539,6 +576,7 @@ HTML_TEMPLATE = """
             document.querySelector('input[name="selection"][value="all"]').checked = true;
             document.getElementById('sync-mode').checked = false;
             document.getElementById('dry-run').checked = false;
+            document.getElementById('fetch-nas').checked = false;
             document.getElementById('status').innerHTML = '';
             usbOptions.style.display = 'none';
         }
