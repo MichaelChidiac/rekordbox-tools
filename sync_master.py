@@ -15,8 +15,11 @@ Quick Start
   # Sync all to USB:
   python3.11 sync_master.py --to-usb --all
 
-  # Incremental sync (only new/changed tracks):
-  python3.11 sync_master.py --to-usb --all --sync
+  # Update library on USB (skip existing, clean deleted):
+  python3.11 sync_master.py --to-usb --all --mode update
+
+  # Push specific playlists to USB (additive only):
+  python3.11 sync_master.py --to-usb --playlists "House" --mode push
 
 Operations
 ----------
@@ -32,7 +35,8 @@ Selection
 USB Options
 -----------
   --usb PATH        USB mount point (auto-detected if omitted)
-  --sync            Incremental: only new/changed tracks (fast re-sync)
+  --mode MODE       Sync mode: update | push | mirror
+  --sync            [Deprecated] Alias for --mode update
   --dry-run         Preview what would be synced without writing
 
 Examples
@@ -43,8 +47,8 @@ Examples
   # Pick playlists for USB export:
   python3.11 sync_master.py --to-usb --select /Volumes/MYUSB
 
-  # Sync all to USB with incremental mode:
-  python3.11 sync_master.py --to-usb --all --sync
+  # Update library on USB (skip existing audio, clean deleted tracks):
+  python3.11 sync_master.py --to-usb --all --mode update
 
   # Preview changes without writing:
   python3.11 sync_master.py --to-usb --all --dry-run
@@ -102,7 +106,7 @@ def sync_to_rekordbox(all_lib=False, playlists=None, dry_run=False):
     return True
 
 def sync_to_usb(all_lib=False, select=False, playlists=None, usb_path=None, 
-                sync_mode=False, dry_run=False, fetch_nas=False):
+                sync_mode=False, dry_run=False, fetch_nas=False, mode=None):
     """Sync to USB (CDJ-compatible export)."""
     args = []
     
@@ -118,7 +122,10 @@ def sync_to_usb(all_lib=False, select=False, playlists=None, usb_path=None,
     if usb_path:
         args.extend(["--usb", usb_path])
     
-    if sync_mode:
+    # --mode takes precedence over legacy --sync
+    if mode:
+        args.extend(["--mode", mode])
+    elif sync_mode:
         args.append("--sync")
     
     if dry_run:
@@ -158,8 +165,10 @@ def main():
     # Options
     ap.add_argument('--usb', metavar='PATH',
                     help='USB mount point (auto-detected if omitted)')
+    ap.add_argument('--mode', choices=['update', 'push', 'mirror'],
+                    help='Sync mode: update (skip existing, clean deleted), push (additive only), mirror (exact match)')
     ap.add_argument('--sync', action='store_true',
-                    help='Incremental sync (only new/changed tracks)')
+                    help='[Deprecated] Alias for --mode update')
     ap.add_argument('--dry-run', action='store_true',
                     help='Preview without writing')
     ap.add_argument('--fetch-nas', action='store_true',
@@ -187,7 +196,8 @@ def main():
             usb_path=args.usb,
             sync_mode=args.sync,
             dry_run=args.dry_run,
-            fetch_nas=args.fetch_nas
+            fetch_nas=args.fetch_nas,
+            mode=args.mode
         )
     
     sys.exit(0 if success else 1)

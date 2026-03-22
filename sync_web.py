@@ -200,7 +200,10 @@ class SyncHandler(BaseHTTPRequestHandler):
         # USB options
         if config.get('usb_path'):
             args.extend(['--usb', config['usb_path']])
-        if config.get('sync_mode'):
+        # --mode takes precedence over legacy sync_mode
+        if config.get('mode') in ('update', 'push', 'mirror'):
+            args.extend(['--mode', config['mode']])
+        elif config.get('sync_mode'):
             args.append('--sync')
         if config.get('dry_run'):
             args.append('--dry-run')
@@ -680,14 +683,25 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 
-                <!-- USB OPTIONS -->
+                <!-- USB SYNC MODE -->
                 <div class="section" id="usb-options" style="display:none;">
-                    <div class="section-title">⚙️ USB Options</div>
+                    <div class="section-title">🔄 Sync Mode</div>
                     <div class="option-group">
-                        <label>
-                            <input type="checkbox" id="sync-mode">
-                            Incremental sync (only new/changed)
+                        <label title="Push everything, skip existing audio, clean up deleted tracks">
+                            <input type="radio" name="sync-mode" value="update" checked>
+                            Update library — skip existing, clean deleted
                         </label>
+                        <label title="Send selected playlists to USB (additive, never deletes)">
+                            <input type="radio" name="sync-mode" value="push">
+                            Push playlists — additive only
+                        </label>
+                        <label title="Keep pinned playlists in perfect sync with USB">
+                            <input type="radio" name="sync-mode" value="mirror">
+                            Mirror pinned — exact sync of pinned playlists
+                        </label>
+                    </div>
+                    <div class="section-title" style="margin-top:12px;">⚙️ Options</div>
+                    <div class="option-group">
                         <label>
                             <input type="checkbox" id="dry-run">
                             Preview only (don't write)
@@ -695,6 +709,15 @@ HTML_TEMPLATE = """
                         <label>
                             <input type="checkbox" id="fetch-nas">
                             <span id="fetch-nas-label">🌐 Fetch missing tracks from NAS</span>
+                        </label>
+                    </div>
+                    <div id="mirror-info" style="display:none; margin-top:8px; padding:8px 12px; background:#1a2a1a; border:1px solid #2d5a2d; border-radius:6px; font-size:0.85em; color:#8abb8a;">
+                        ⚡ Mirror mode uses your pinned playlists. Pin playlists using the 📌 icon in the tree below.
+                    </div>
+                    <div class="option-group" style="margin-top:8px;">
+                        <label title="Automatically mirror pinned playlists when a USB is plugged in">
+                            <input type="checkbox" id="auto-mirror-toggle">
+                            Auto-mirror on USB plug-in
                         </label>
                     </div>
                 </div>
@@ -833,6 +856,92 @@ HTML_TEMPLATE = """
                 }
             });
         });
+        
+        // Sync mode radio handler
+        var syncModeRadios = document.querySelectorAll('input[name="sync-mode"]');
+        var mirrorInfo = document.getElementById('mirror-info');
+        var selectionSection = document.querySelector('#sync-tab .section:nth-child(3)');
+        
+        syncModeRadios.forEach(function(r) {
+            r.addEventListener('change', function() {
+                var mode = document.querySelector('input[name="sync-mode"]:checked').value;
+                mirrorInfo.style.display = mode === 'mirror' ? 'block' : 'none';
+                // Mirror mode: hide scope selector (uses pinned), show playlist tree for pinning
+                if (mode === 'mirror') {
+                    if (selectionSection) selectionSection.style.display = 'none';
+                    playlistTree.style.display = 'block';
+                    if (!playlistTree.dataset.loaded) loadPlaylists();
+                } else {
+                    if (selectionSection) selectionSection.style.display = 'block';
+                }
+            });
+        });
+        
+        // Auto-mirror on USB detection
+        var autoMirrorCountdown = null;
+        var autoMirrorTimer = null;
+        
+        function loadAutoMirrorSetting() {
+            fetch('/api/sync-config')
+                .then(function(r) { return r.json(); })
+                .then(function(config) {
+                    var cb = document.getElementById('auto-mirror-toggle');
+                    if (cb) cb.checked = !!config.auto_mirror;
+                })
+                .catch(function() {});
+        }
+        
+        var autoMirrorToggle = document.getElementById('auto-mirror-toggle');
+        if (autoMirrorToggle) {
+            autoMirrorToggle.addEventListener('change', function() {
+                fetch('/api/sync-config')
+                    .then(function(r) { return r.json(); })
+                    .then(function(config) {
+                        config.auto_mirror = autoMirrorToggle.checked;
+                        return fetch('/api/sync-config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(config)
+                        });
+                    })
+                    .catch(function() {});
+            });
+        }
+        
+        function triggerAutoMirror() {
+            if (autoMirrorCountdown !== null) return; // already running
+            var status = document.getElementById('status');
+            var seconds = 5;
+            autoMirrorCountdown = seconds;
+            
+            status.className = 'status loading';
+            status.innerHTML = '⚡ Auto-mirror starting in ' + seconds + 's... <button class="btn-secondary" style="margin-left:8px; padding:2px 10px; font-size:0.85em;" onclick="cancelAutoMirror()">Cancel</button>';
+            
+            autoMirrorTimer = setInterval(function() {
+                autoMirrorCountdown--;
+                if (autoMirrorCountdown <= 0) {
+                    clearInterval(autoMirrorTimer);
+                    autoMirrorTimer = null;
+                    autoMirrorCountdown = null;
+                    autoSyncPinned();
+                } else {
+                    status.innerHTML = '⚡ Auto-mirror starting in ' + autoMirrorCountdown + 's... <button class="btn-secondary" style="margin-left:8px; padding:2px 10px; font-size:0.85em;" onclick="cancelAutoMirror()">Cancel</button>';
+                }
+            }, 1000);
+        }
+        
+        function cancelAutoMirror() {
+            if (autoMirrorTimer) {
+                clearInterval(autoMirrorTimer);
+                autoMirrorTimer = null;
+            }
+            autoMirrorCountdown = null;
+            var status = document.getElementById('status');
+            status.className = 'status';
+            status.innerHTML = 'Auto-mirror cancelled.';
+        }
+        
+        loadAutoMirrorSetting();
         
         // Check NAS availability on load
         fetch('/api/nas-status')
@@ -1136,6 +1245,8 @@ HTML_TEMPLATE = """
             return sel ? sel.value : lastUsbPath;
         }
         
+        var prevUsbConnected = false;
+        
         function checkUsbStatus() {
             fetch('/api/usb-status')
                 .then(function(r) { return r.json(); })
@@ -1143,6 +1254,7 @@ HTML_TEMPLATE = """
                     allUsbDrives = data.drives || [];
                     lastUsbPath = data.connected ? data.path : null;
                     var el = document.getElementById('usb-status');
+                    if (!data.connected) {
                         el.className = 'usb-status usb-disconnected';
                         el.innerHTML = '💾 No Pioneer USB detected';
                     } else if (allUsbDrives.length === 1) {
@@ -1159,6 +1271,16 @@ HTML_TEMPLATE = """
                         el.innerHTML = html;
                     }
                     updateUsbAutoSyncButton();
+                    
+                    // Auto-mirror trigger: USB just connected + auto_mirror enabled + pinned playlists exist
+                    var justConnected = data.connected && !prevUsbConnected;
+                    prevUsbConnected = data.connected;
+                    if (justConnected && pinnedPlaylists.size > 0) {
+                        var cb = document.getElementById('auto-mirror-toggle');
+                        if (cb && cb.checked) {
+                            triggerAutoMirror();
+                        }
+                    }
                 })
                 .catch(function() {});
         }
@@ -1172,7 +1294,7 @@ HTML_TEMPLATE = """
                 var btn = document.createElement('button');
                 btn.id = 'auto-sync-btn';
                 btn.className = 'auto-sync-btn';
-                btn.textContent = '⚡ Auto-sync pinned';
+                btn.textContent = '⚡ Mirror pinned';
                 btn.addEventListener('click', autoSyncPinned);
                 // append after any select dropdown
                 el.appendChild(btn);
@@ -1187,7 +1309,7 @@ HTML_TEMPLATE = """
                 }
                 var status = document.getElementById('status');
                 status.className = 'status loading';
-                status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Auto-syncing ' + names.length + ' pinned playlist(s) to USB...';
+                status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Mirroring ' + names.length + ' pinned playlist(s) to USB...';
                 
                 fetch('/api/sync', {
                     method: 'POST',
@@ -1197,7 +1319,7 @@ HTML_TEMPLATE = """
                         selection: 'playlists',
                         playlists: names,
                         usb_path: getSelectedUsbPath(),
-                        sync_mode: true,
+                        mode: 'mirror',
                         dry_run: false,
                         fetch_nas: false
                     })
@@ -1206,10 +1328,10 @@ HTML_TEMPLATE = """
                 .then(function(data) {
                     if (data.success) {
                         status.className = 'status success';
-                        status.innerHTML = '✅ Auto-sync completed!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
+                        status.innerHTML = '✅ Mirror sync completed!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
                     } else {
                         status.className = 'status error';
-                        status.innerHTML = '❌ Auto-sync failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
+                        status.innerHTML = '❌ Mirror sync failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
                     }
                 })
                 .catch(function(e) {
@@ -1249,16 +1371,26 @@ HTML_TEMPLATE = """
         function startSync() {
             var target = document.querySelector('input[name="target"]:checked').value;
             var selection = document.querySelector('input[name="selection"]:checked').value;
-            var syncMode = document.getElementById('sync-mode').checked;
+            var syncModeRadio = document.querySelector('input[name="sync-mode"]:checked');
+            var mode = syncModeRadio ? syncModeRadio.value : 'update';
             var dryRun = document.getElementById('dry-run').checked;
             var fetchNas = document.getElementById('fetch-nas').checked;
             
-            var config = { target: target, selection: selection, sync_mode: syncMode, dry_run: dryRun, fetch_nas: fetchNas };
+            var config = { target: target, selection: selection, mode: mode, dry_run: dryRun, fetch_nas: fetchNas };
             if (target === 'usb') {
                 config.usb_path = getSelectedUsbPath();
             }
             
-            if (selection === 'playlists') {
+            // Mirror mode uses pinned playlists
+            if (mode === 'mirror') {
+                var names = findPlaylistNames(allPlaylistData, pinnedPlaylists);
+                if (names.length === 0) {
+                    alert('No pinned playlists for mirror mode. Pin playlists using the 📌 icon first.');
+                    return;
+                }
+                config.selection = 'playlists';
+                config.playlists = names;
+            } else if (selection === 'playlists') {
                 var names = getCheckedSelectionNames();
                 if (names.length === 0) {
                     alert('Please select at least one playlist or folder');
@@ -1295,13 +1427,16 @@ HTML_TEMPLATE = """
         function resetForm() {
             document.querySelector('input[name="target"][value="rekordbox"]').checked = true;
             document.querySelector('input[name="selection"][value="all"]').checked = true;
-            document.getElementById('sync-mode').checked = false;
+            var updateRadio = document.querySelector('input[name="sync-mode"][value="update"]');
+            if (updateRadio) updateRadio.checked = true;
             document.getElementById('dry-run').checked = false;
             document.getElementById('fetch-nas').checked = false;
             document.getElementById('status').className = 'status';
             document.getElementById('status').innerHTML = '';
             usbOptions.style.display = 'none';
             playlistTree.style.display = 'none';
+            var mirrorInfo = document.getElementById('mirror-info');
+            if (mirrorInfo) mirrorInfo.style.display = 'none';
         }
         
         // ── HISTORY TAB ──────────────────────────────────────────────────

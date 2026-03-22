@@ -4,23 +4,35 @@ traktor_to_usb.py
 =================
 Exports Traktor playlists directly to a Pioneer USB drive (no Rekordbox needed).
 
-Modes
------
+Selection
+---------
   --select          Interactive checkbox UI — pick folders/playlists to export
   --all             Export the entire library
   --playlists NAME  Export specific folder/playlist names
 
+Sync modes (--mode)
+-------------------
+  update  (default)  Skip existing tracks, update changed metadata, delete only
+                     tracks removed from master.db entirely. Always rebuilds
+                     the playlist tree from the current selection.
+  push               Additive only — copies selected playlists/tracks to USB,
+                     never deletes anything, merges into existing playlist tree.
+  mirror             USB exactly matches the selected playlists. Wipes + rebuilds
+                     playlist tree, deletes tracks not in scope, cleans orphans.
+
 Flags
 -----
-  --sync            Incremental sync: only copy new/changed tracks (fast re-sync)
+  --mode MODE       Sync mode: update, push, or mirror (default: update)
+  --sync            [Deprecated] Alias for --mode update
   --usb PATH        USB mount point, e.g. /Volumes/MYUSB (auto-detected if omitted)
   --dry-run         Preview what would be written without touching anything
 
 Examples
 --------
   python3.11 traktor_to_usb.py --select --usb /Volumes/MYUSB
-  python3.11 traktor_to_usb.py --all --usb /Volumes/MYUSB --sync
-  python3.11 traktor_to_usb.py --playlists "03 - Events" "04 - History" --usb /Volumes/MYUSB
+  python3.11 traktor_to_usb.py --all --usb /Volumes/MYUSB --mode update
+  python3.11 traktor_to_usb.py --playlists "03 - Events" --usb /Volumes/MYUSB --mode push
+  python3.11 traktor_to_usb.py --all --usb /Volumes/MYUSB --mode mirror --dry-run
   python3.11 traktor_to_usb.py --select --dry-run
 
 What it writes
@@ -311,14 +323,16 @@ def run_selector(tree) -> list:
     return selected  # list of pl_id strings
 
 # ── Core export ────────────────────────────────────────────────────────────────
-def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool, dry_run: bool, fetch_nas: bool = False):
+MODE_LABELS = {'update': 'library update', 'push': 'selective push', 'mirror': 'mirror sync'}
+
+def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'update', dry_run: bool = False, fetch_nas: bool = False):
     usb_rb_dir  = usb_path / PIONEER_DIR / "rekordbox"
     usb_anlz    = usb_path / PIONEER_DIR / "USBANLZ"
     usb_audio   = usb_path / AUDIO_DIR
     usb_db_path = usb_rb_dir / "exportLibrary.db"
 
     print(f"\n{'[DRY RUN] ' if dry_run else ''}Exporting to: {usb_path}")
-    print(f"  Mode: {'incremental sync' if sync_mode else 'full export'}")
+    print(f"  Mode: {MODE_LABELS.get(mode, mode)}")
     print(f"  Playlists: {len(playlist_ids)}")
 
     # ── Open master.db ────────────────────────────────────────────────────────
@@ -340,9 +354,10 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
         )
     print(f"  Total tracks in scope: {len(all_content_ids)}")
 
-    # On sync: figure out which tracks are genuinely new/changed
+    # ── Determine existing USB state ─────────────────────────────────────────
+    existing_ids = set()
     last_usn = 0
-    if sync_mode and not dry_run and usb_db_path.exists():
+    if usb_db_path.exists():
         usb_con_check = open_db(usb_db_path)
         last_usn = get_last_sync_usn(usb_con_check)
         existing_ids = set(
@@ -350,27 +365,44 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
         )
         usb_con_check.close()
         print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
+
+    # ── Compute tracks to process and deletions based on mode ────────────────
+    changed_ids = set()
+
+    if mode == 'update':
         # New tracks: in scope but not yet on USB
         new_ids = all_content_ids - existing_ids
-        # Changed tracks: already on USB but updated in master since last sync
+        # Changed tracks: already on USB but updated since last sync
         if last_usn > 0:
-            changed_rows = master.execute(
+            changed_ids = {r[0] for r in master.execute(
                 "SELECT ID FROM djmdContent WHERE rb_local_usn > ?", (last_usn,)
-            ).fetchall()
-            changed_ids = {r[0] for r in changed_rows} & all_content_ids
-        else:
-            changed_ids = set()
-        # Deleted tracks: on USB but no longer in scope
+            ).fetchall()} & existing_ids
+        # Delete only tracks completely gone from master.db
+        all_master_ids = set(r[0] for r in master.execute(
+            "SELECT ID FROM djmdContent"
+        ).fetchall())
+        deleted_ids = existing_ids - all_master_ids
+        tracks_to_process = new_ids | changed_ids
+        print(f"  New: {len(new_ids)}  Changed: {len(changed_ids)}  Deleted: {len(deleted_ids)}")
+
+    elif mode == 'push':
+        # Only add tracks not already on USB — never delete
+        tracks_to_process = all_content_ids - existing_ids
+        deleted_ids = set()
+        print(f"  New: {len(tracks_to_process)}  (push mode — no deletions)")
+
+    elif mode == 'mirror':
+        # New tracks: in scope but not on USB
+        new_ids = all_content_ids - existing_ids
+        # Changed tracks: on USB and updated since last sync, within scope
+        if last_usn > 0:
+            changed_ids = {r[0] for r in master.execute(
+                "SELECT ID FROM djmdContent WHERE rb_local_usn > ?", (last_usn,)
+            ).fetchall()} & all_content_ids
+        # Delete tracks no longer in scope
         deleted_ids = existing_ids - all_content_ids
         tracks_to_process = new_ids | changed_ids
         print(f"  New: {len(new_ids)}  Changed: {len(changed_ids)}  Deleted: {len(deleted_ids)}")
-        if not tracks_to_process and not deleted_ids:
-            print("  ✅ Already up to date — nothing to do.")
-            master.close()
-            return
-    else:
-        tracks_to_process = all_content_ids
-        deleted_ids = set()
 
     # ── Load track metadata ────────────────────────────────────────────────────
     tracks = {}
@@ -454,7 +486,13 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
         print(f"  Would copy {sum(len(v) for v in anlz_map.values())} ANLZ files")
         if deleted_ids:
             print(f"  Would remove {len(deleted_ids)} deleted tracks from DB")
-        print(f"  Would update playlist structure ({len(playlist_ids)} playlists)")
+        if mode == 'push':
+            print(f"  Would merge {len(playlist_ids)} playlists into existing tree (push — no wipe)")
+        elif mode == 'mirror':
+            print(f"  Would rebuild playlist tree ({len(playlist_ids)} playlists, mirror — exact match)")
+            print(f"  Would clean up orphaned tracks not in any playlist")
+        else:
+            print(f"  Would rebuild playlist tree ({len(playlist_ids)} playlists)")
         return
 
     # ── Prepare directories + DB ───────────────────────────────────────────────
@@ -543,12 +581,12 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
                     nas_fetch_failed += 1
 
         if not got_audio:
-            if sync_mode:
-                # In sync mode, track is likely already on USB — keep its DB entry, just skip audio copy
+            if cid in existing_ids:
+                # Track already on USB — keep its audio, just update DB entry
                 usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
                 skipped_audio += 1
             else:
-                # Full export — track is genuinely missing, skip entirely
+                # Track is genuinely missing — skip entirely
                 if folder_path:
                     missing_audio.append(folder_path)
                 continue
@@ -608,22 +646,37 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
         print(f"  🌐 NAS:   {fetched_from_nas} fetched, {nas_fetch_failed} failed")
     print(f"  ✅ ANLZ:   {copied_anlz} new files")
 
-    # ── Rebuild playlist structure (always full — fast, no audio I/O) ─────────
-    # Wipe and rewrite playlists so order/membership is always current
-    usb_con.execute("DELETE FROM djmdPlaylist")
-    usb_con.execute("DELETE FROM djmdSongPlaylist")
+    # ── Rebuild playlist structure ────────────────────────────────────────────
+    if mode == 'push':
+        # Push mode: merge into existing playlist tree (don't wipe)
+        existing_playlist_ids = set(
+            str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdPlaylist").fetchall()
+        )
+        existing_song_keys = set(
+            (str(r[0]), str(r[1])) for r in usb_con.execute(
+                "SELECT PlaylistID, ContentID FROM djmdSongPlaylist"
+            ).fetchall()
+        )
+    else:
+        # Update / mirror: wipe and rebuild from scratch
+        usb_con.execute("DELETE FROM djmdPlaylist")
+        usb_con.execute("DELETE FROM djmdSongPlaylist")
+        existing_playlist_ids = set()
+        existing_song_keys = set()
 
     # Build ancestor paths for all selected playlists
     master = open_db(MASTER_DB)
-    all_content_ids_str = set(
-        r[0] for r in master.execute("SELECT ID FROM djmdContent").fetchall()
-    ) if not playlist_ids else all_content_ids
 
     needed_paths = set()
     for path, (pl_id, attr) in tree.items():
         if attr == 0 and pl_id in playlist_ids:
             for i in range(1, len(path) + 1):
                 needed_paths.add(path[:i])
+
+    # Determine which content IDs are valid on USB for playlist links
+    usb_valid_ids = set(
+        str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdContent").fetchall()
+    )
 
     manifest_nodes = []
     pl_count = fold_count = link_count = 0
@@ -642,36 +695,108 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
         sibling_seq[seq_key] = seq + 1
 
         manifest_nodes.append((int(pl_id), int(parent_db_id) if parent_db_id != 'root' else 0, attr))
-        usb_con.execute("""INSERT OR REPLACE INTO djmdPlaylist
-            (ID,Seq,Name,Attribute,ParentID,UUID,
-             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-             rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?)""",
-            (str(pl_id), seq, path[-1], attr,
-             str(parent_db_id) if parent_db_id != 'root' else 'root',
-             new_uuid(), usn, ts(), ts()))
 
-        if attr == 0:
-            pl_count += 1
-            links = master.execute(
-                "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
-                (str(pl_id),)
-            ).fetchall()
-            for link in links:
-                if str(link[1]) in all_content_ids:
-                    usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
-                        (ID,PlaylistID,ContentID,TrackNo,UUID,
-                         rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-                         rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
-                        (str(link[0]), str(pl_id), str(link[1]), link[2],
-                         new_uuid(), usn, ts(), ts()))
-                    link_count += 1
+        if mode == 'push' and str(pl_id) in existing_playlist_ids:
+            # Push mode: playlist already exists — don't recreate, just add new tracks
+            if attr == 0:
+                pl_count += 1
+                links = master.execute(
+                    "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
+                    (str(pl_id),)
+                ).fetchall()
+                for link in links:
+                    if str(link[1]) in usb_valid_ids and (str(pl_id), str(link[1])) not in existing_song_keys:
+                        usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
+                            (ID,PlaylistID,ContentID,TrackNo,UUID,
+                             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                             rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
+                            (str(link[0]), str(pl_id), str(link[1]), link[2],
+                             new_uuid(), usn, ts(), ts()))
+                        link_count += 1
+            else:
+                fold_count += 1
         else:
-            fold_count += 1
+            usb_con.execute("""INSERT OR REPLACE INTO djmdPlaylist
+                (ID,Seq,Name,Attribute,ParentID,UUID,
+                 rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                 rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?)""",
+                (str(pl_id), seq, path[-1], attr,
+                 str(parent_db_id) if parent_db_id != 'root' else 'root',
+                 new_uuid(), usn, ts(), ts()))
+
+            if attr == 0:
+                pl_count += 1
+                links = master.execute(
+                    "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
+                    (str(pl_id),)
+                ).fetchall()
+                for link in links:
+                    if str(link[1]) in usb_valid_ids:
+                        usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
+                            (ID,PlaylistID,ContentID,TrackNo,UUID,
+                             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                             rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
+                            (str(link[0]), str(pl_id), str(link[1]), link[2],
+                             new_uuid(), usn, ts(), ts()))
+                        link_count += 1
+            else:
+                fold_count += 1
 
     master.close()
     usb_con.commit()
     checkpoint("Tracks & playlists committed to DB")
     print(f"  ✅ Playlists: {pl_count} playlists, {fold_count} folders, {link_count} links")
+
+    # ── Mirror mode: orphan cleanup ───────────────────────────────────────────
+    if mode == 'mirror':
+        orphan_rows = usb_con.execute(
+            "SELECT c.ID, c.FolderPath FROM djmdContent c WHERE NOT EXISTS "
+            "(SELECT 1 FROM djmdSongPlaylist sp WHERE sp.ContentID = c.ID)"
+        ).fetchall()
+        if orphan_rows:
+            orphan_ids = [r[0] for r in orphan_rows]
+            orphan_paths = [r[1] for r in orphan_rows]
+            ph_orph = ','.join('?' * len(orphan_ids))
+            usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID IN ({ph_orph})", orphan_ids)
+            usb_con.execute(f"DELETE FROM djmdContent WHERE ID IN ({ph_orph})", orphan_ids)
+            # Delete orphan audio files from USB
+            for fpath in orphan_paths:
+                if fpath:
+                    audio_file = usb_path / fpath.lstrip('/')
+                    if audio_file.exists():
+                        audio_file.unlink()
+            usb_con.commit()
+            print(f"  🧹 Cleaned up {len(orphan_ids)} orphaned tracks")
+
+        # Scan /Contents/ for audio files not in DB
+        db_paths = set(
+            r[0] for r in usb_con.execute("SELECT FolderPath FROM djmdContent").fetchall()
+            if r[0]
+        )
+        audio_dir = usb_path / AUDIO_DIR
+        if audio_dir.exists():
+            stale_files = 0
+            for audio_file in audio_dir.rglob('*'):
+                if audio_file.is_file():
+                    rel_path = '/' + str(audio_file.relative_to(usb_path))
+                    if rel_path not in db_paths:
+                        audio_file.unlink()
+                        stale_files += 1
+            # Clean up empty artist directories
+            for d in audio_dir.iterdir():
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            if stale_files:
+                print(f"  🧹 Removed {stale_files} stale audio files from {AUDIO_DIR}/")
+
+    # ── Push mode: rebuild manifest from USB DB to include all playlists ──────
+    if mode == 'push':
+        manifest_nodes = []
+        for r in usb_con.execute(
+            "SELECT ID, ParentID, Attribute FROM djmdPlaylist ORDER BY Seq"
+        ).fetchall():
+            parent_dec = 0 if str(r[1]) == 'root' else int(r[1])
+            manifest_nodes.append((int(r[0]), parent_dec, r[2]))
 
     # ── masterPlaylists6.xml ───────────────────────────────────────────────────
     xml_manifest = usb_rb_dir / "masterPlaylists6.xml"
@@ -715,19 +840,30 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    mode = ap.add_mutually_exclusive_group()
-    mode.add_argument('--select',    action='store_true', help='Interactive UI to select playlists')
-    mode.add_argument('--all',       action='store_true', help='Export entire library')
-    mode.add_argument('--playlists', nargs='+', metavar='NAME',
+    scope = ap.add_mutually_exclusive_group()
+    scope.add_argument('--select',    action='store_true', help='Interactive UI to select playlists')
+    scope.add_argument('--all',       action='store_true', help='Export entire library')
+    scope.add_argument('--playlists', nargs='+', metavar='NAME',
                       help='Folder/playlist names to export')
 
     ap.add_argument('--usb',      metavar='PATH', help='USB mount point (auto-detected if omitted)')
+    ap.add_argument('--mode',     choices=['update', 'push', 'mirror'], default=None,
+                    help='Sync mode: update (skip existing, clean deleted), push (additive only), mirror (exact match)')
     ap.add_argument('--sync',     action='store_true',
-                    help='Incremental sync: only process new/changed tracks')
+                    help='[Deprecated] Alias for --mode update')
     ap.add_argument('--dry-run',  action='store_true', help='Preview without writing')
     ap.add_argument('--fetch-nas', action='store_true',
                     help='Fetch missing tracks from NAS via traktor-ml (requires server + SSH tunnel)')
     args = ap.parse_args()
+
+    # Resolve sync mode
+    if args.mode:
+        sync_mode = args.mode
+    elif args.sync:
+        print("  ⚠️  --sync is deprecated, use --mode update")
+        sync_mode = 'update'
+    else:
+        sync_mode = 'update'  # default
 
     try:
         # ── Resolve USB path ──────────────────────────────────────────────────────
@@ -809,7 +945,7 @@ def main():
                 ap.print_help()
                 sys.exit(1)
 
-        export_to_usb(usb_path, playlist_ids, tree, args.sync, args.dry_run, args.fetch_nas)
+        export_to_usb(usb_path, playlist_ids, tree, sync_mode, args.dry_run, args.fetch_nas)
         print("\n✅ Export completed successfully")
 
     except Exception as e:
