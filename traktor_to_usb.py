@@ -395,13 +395,18 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     existing_ids = set()
     last_usn = 0
     if usb_db_path.exists():
-        usb_con_check = open_db(usb_db_path)
-        last_usn = get_last_sync_usn(usb_con_check)
-        existing_ids = set(
-            r[0] for r in usb_con_check.execute("SELECT ID FROM djmdContent").fetchall()
-        )
-        usb_con_check.close()
-        print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
+        try:
+            usb_con_check = open_db(usb_db_path)
+            last_usn = get_last_sync_usn(usb_con_check)
+            existing_ids = set(
+                r[0] for r in usb_con_check.execute("SELECT ID FROM djmdContent").fetchall()
+            )
+            usb_con_check.close()
+            print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
+        except Exception as e:
+            print(f"  ⚠️  Could not read USB DB: {e}")
+            print(f"  Tip: Ensure USB is still connected and not being accessed by Rekordbox")
+            raise
 
     # ── Compute tracks to process and deletions based on mode ────────────────
     changed_ids = set()
