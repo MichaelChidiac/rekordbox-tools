@@ -395,24 +395,13 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     existing_ids = set()
     last_usn = 0
     if usb_db_path.exists():
-        try:
-            usb_con_check = open_db(usb_db_path)
-            last_usn = get_last_sync_usn(usb_con_check)
-            existing_ids = set(
-                r[0] for r in usb_con_check.execute("SELECT ID FROM djmdContent").fetchall()
-            )
-            usb_con_check.close()
-            print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
-        except Exception as e:
-            print(f"  ⚠️  Could not read existing USB DB ({type(e).__name__}), backing up and recreating")
-            if not dry_run:
-                import shutil
-                backup = usb_db_path.parent / f"exportLibrary_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-                shutil.copy2(usb_db_path, backup)
-                usb_db_path.unlink()
-                print(f"  Backed up to: {backup.name}")
-            existing_ids = set()
-            last_usn = 0
+        usb_con_check = open_db(usb_db_path)
+        last_usn = get_last_sync_usn(usb_con_check)
+        existing_ids = set(
+            r[0] for r in usb_con_check.execute("SELECT ID FROM djmdContent").fetchall()
+        )
+        usb_con_check.close()
+        print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
 
     # ── Compute tracks to process and deletions based on mode ────────────────
     changed_ids = set()
