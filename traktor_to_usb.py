@@ -465,21 +465,23 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
 
         # Audio
         src_audio = Path(folder_path) if folder_path else None
-        if src_audio and src_audio.exists():
-            artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
-            dst_dir = usb_audio / artist_slug
-            dst_dir.mkdir(exist_ok=True)
-            dst_audio = dst_dir / filename
-            if not dst_audio.exists():
-                shutil.copy2(src_audio, dst_audio)
-                copied_audio += 1
-            else:
-                skipped_audio += 1
-            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
-        else:
+        if not (src_audio and src_audio.exists()):
+            # Skip missing tracks entirely — don't add to database
             if folder_path:
                 missing_audio.append(folder_path)
-            usb_audio_rel = f"/{AUDIO_DIR}/Unknown/{filename or 'unknown'}"
+            continue
+
+        # File exists — proceed with export
+        artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
+        dst_dir = usb_audio / artist_slug
+        dst_dir.mkdir(exist_ok=True)
+        dst_audio = dst_dir / filename
+        if not dst_audio.exists():
+            shutil.copy2(src_audio, dst_audio)
+            copied_audio += 1
+        else:
+            skipped_audio += 1
+        usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
 
         # ANLZ
         for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
