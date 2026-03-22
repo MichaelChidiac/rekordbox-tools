@@ -75,11 +75,9 @@ class SyncHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
         
         elif parsed_path.path == '/api/usb-status':
-            usb_path = self.detect_usb()
-            if usb_path:
-                self.send_json(200, {"connected": True, "path": usb_path})
-            else:
-                self.send_json(200, {"connected": False})
+            drives = self.detect_usb()
+            self.send_json(200, {"connected": len(drives) > 0, "drives": drives,
+                                  "path": drives[0]["path"] if drives else None})
         
         else:
             self.send_response(404)
@@ -384,14 +382,15 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(e), "trace": traceback.format_exc()[-500:]})
 
     def detect_usb(self):
-        """Check if a Pioneer USB drive is connected."""
+        """Return list of all connected Pioneer USB drives as dicts with path and name."""
+        drives = []
         try:
-            for vol in Path("/Volumes").iterdir():
+            for vol in sorted(Path("/Volumes").iterdir()):
                 if (vol / "PIONEER").is_dir() or (vol / ".PIONEER").is_dir():
-                    return str(vol)
+                    drives.append({"path": str(vol), "name": vol.name})
         except OSError:
             pass
-        return None
+        return drives
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -1130,19 +1129,34 @@ HTML_TEMPLATE = """
         
         // ── USB STATUS ───────────────────────────────────────────────────
         var lastUsbPath = null;
+        var allUsbDrives = [];
+        
+        function getSelectedUsbPath() {
+            var sel = document.getElementById('usb-drive-select');
+            return sel ? sel.value : lastUsbPath;
+        }
         
         function checkUsbStatus() {
             fetch('/api/usb-status')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    allUsbDrives = data.drives || [];
                     lastUsbPath = data.connected ? data.path : null;
                     var el = document.getElementById('usb-status');
-                    if (data.connected) {
-                        el.className = 'usb-status usb-connected';
-                        el.innerHTML = '💾 USB connected: <strong>' + escapeHtml(data.path) + '</strong>';
-                    } else {
                         el.className = 'usb-status usb-disconnected';
                         el.innerHTML = '💾 No Pioneer USB detected';
+                    } else if (allUsbDrives.length === 1) {
+                        el.className = 'usb-status usb-connected';
+                        el.innerHTML = '💾 USB: <strong>' + escapeHtml(allUsbDrives[0].name) + '</strong> (' + escapeHtml(allUsbDrives[0].path) + ')';
+                    } else {
+                        el.className = 'usb-status usb-connected';
+                        var html = '💾 ' + allUsbDrives.length + ' USBs connected — target: ';
+                        html += '<select id="usb-drive-select" style="background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.9em;">';
+                        allUsbDrives.forEach(function(d) {
+                            html += '<option value="' + escapeHtml(d.path) + '">' + escapeHtml(d.name) + ' (' + escapeHtml(d.path) + ')</option>';
+                        });
+                        html += '</select>';
+                        el.innerHTML = html;
                     }
                     updateUsbAutoSyncButton();
                 })
@@ -1160,6 +1174,7 @@ HTML_TEMPLATE = """
                 btn.className = 'auto-sync-btn';
                 btn.textContent = '⚡ Auto-sync pinned';
                 btn.addEventListener('click', autoSyncPinned);
+                // append after any select dropdown
                 el.appendChild(btn);
             }
         }
@@ -1181,6 +1196,7 @@ HTML_TEMPLATE = """
                         target: 'usb',
                         selection: 'playlists',
                         playlists: names,
+                        usb_path: getSelectedUsbPath(),
                         sync_mode: true,
                         dry_run: false,
                         fetch_nas: false
@@ -1238,6 +1254,9 @@ HTML_TEMPLATE = """
             var fetchNas = document.getElementById('fetch-nas').checked;
             
             var config = { target: target, selection: selection, sync_mode: syncMode, dry_run: dryRun, fetch_nas: fetchNas };
+            if (target === 'usb') {
+                config.usb_path = getSelectedUsbPath();
+            }
             
             if (selection === 'playlists') {
                 var names = getCheckedSelectionNames();
