@@ -543,11 +543,18 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, sync_mode: bool
                     nas_fetch_failed += 1
 
         if not got_audio:
-            if folder_path:
-                missing_audio.append(folder_path)
-            continue
+            if sync_mode:
+                # In sync mode, track is likely already on USB — keep its DB entry, just skip audio copy
+                usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
+                skipped_audio += 1
+            else:
+                # Full export — track is genuinely missing, skip entirely
+                if folder_path:
+                    missing_audio.append(folder_path)
+                continue
 
-        usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
+        else:
+            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
 
         # ANLZ
         for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
