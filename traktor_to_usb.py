@@ -233,7 +233,7 @@ def init_usb_db(usb_con, usb_path: Path):
     master = open_db(MASTER_DB)
     for k in master.execute("SELECT ID, ScaleName, Seq FROM djmdKey").fetchall():
         usb_con.execute("INSERT OR IGNORE INTO djmdKey VALUES (?,?,?)", k)
-    for c in master.execute("SELECT ID, ColorCode, SortKey, Name FROM djmdColor").fetchall():
+    for c in master.execute("SELECT ID, ColorCode, SortKey, Commnt FROM djmdColor").fetchall():
         usb_con.execute("INSERT OR IGNORE INTO djmdColor VALUES (?,?,?,?)", c)
     master.close()
     db_id  = str(make_id(str(usb_path)))
