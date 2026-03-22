@@ -162,8 +162,7 @@ def wipe_usb(usb_path: Path, dry_run: bool = False):
     usb_db_path = usb_rb_dir / "exportLibrary.db"
     if not usb_db_path.exists():
         con = open_db(usb_db_path)
-        con.executescript(SCHEMA_SQL)
-        con.commit()
+        init_usb_db(con, usb_path)
         con.close()
 
     print(f"\n✅ USB wiped. Ready for fresh export.")
