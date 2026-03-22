@@ -9,6 +9,9 @@ master*.db
 master*.db.backup*
 collection.nml.backup*
 
+# User config (pinned playlists)
+sync_config.json
+
 # Python cache
 __pycache__/
 *.pyc
