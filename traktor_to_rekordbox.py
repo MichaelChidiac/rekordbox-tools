@@ -421,7 +421,7 @@ def parse_playlist_tree(root, tracks, track_lookup):
             stats['smartlists'] += 1
             sl_el = node_el.find('SMARTLIST')
             if sl_el is None:
-                return {'type': 'playlist', 'name': name + ' [smart]', 'keys': []}
+                return {'type': 'playlist', 'name': name + ' [smart]', 'keys': [], 'smart': True}
             se = sl_el.find('SEARCH_EXPRESSION')
             query = se.get('QUERY', '') if se is not None else ''
             if query:
@@ -429,7 +429,7 @@ def parse_playlist_tree(root, tracks, track_lookup):
                 stats['smart_expanded'] += 1
             else:
                 keys = []
-            return {'type': 'playlist', 'name': name, 'keys': keys}
+            return {'type': 'playlist', 'name': name, 'keys': keys, 'smart': True}
 
         return None
 

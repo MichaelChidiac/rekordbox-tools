@@ -61,6 +61,9 @@ class SyncHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/playlists':
             self.get_playlist_tree_json()
         
+        elif parsed_path.path == '/api/traktor-playlists':
+            self.get_traktor_playlist_tree_json()
+        
         elif parsed_path.path == '/api/sync-config':
             try:
                 if SYNC_CONFIG.exists():
@@ -99,6 +102,13 @@ class SyncHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 result = self.execute_import_history(data)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+        elif parsed_path.path == '/api/traktor-sync':
+            try:
+                data = json.loads(body)
+                result = self.execute_traktor_sync(data)
                 self.send_json(200, result)
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
@@ -280,6 +290,98 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json(200, tree)
         except Exception as e:
             self.send_json(500, {"error": str(e)})
+
+    def execute_traktor_sync(self, config):
+        """Run traktor_to_master.py to sync Traktor playlists directly to master.db."""
+        script = TOOLS_DIR / "traktor_to_master.py"
+        if not script.exists():
+            return {"success": False, "error": "traktor_to_master.py not found"}
+
+        args = []
+        if config.get('selection') == 'all':
+            args.append('--all')
+        elif config.get('selection') == 'playlists' and config.get('playlists'):
+            args.extend(['--playlists'] + config['playlists'])
+        else:
+            args.append('--all')
+
+        if config.get('dry_run'):
+            args.append('--dry-run')
+
+        cmd = [sys.executable, str(script)] + args
+        print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            return {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-2000:] if result.stdout else "",
+                "stderr": result.stderr[-1000:] if result.stderr else ""
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Timeout (>1 hour)"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_traktor_playlist_tree_json(self):
+        """Build playlist tree from Traktor collection.nml (with smartlists expanded)."""
+        DEFAULT_NML = Path.home() / "Documents/Native Instruments/Traktor 3.11.1/collection.nml"
+        if not DEFAULT_NML.exists():
+            self.send_json(404, {"error": f"collection.nml not found at {DEFAULT_NML}"})
+            return
+
+        try:
+            import xml.etree.ElementTree as ET
+            import sys as _sys
+            _sys.path.insert(0, str(TOOLS_DIR))
+            from traktor_to_rekordbox import parse_tracks, make_track_lookup, parse_playlist_tree
+
+            content = DEFAULT_NML.read_text(encoding='utf-8')
+            root = ET.fromstring(content)
+
+            tracks = parse_tracks(root)
+            track_lookup = make_track_lookup(tracks)
+            playlist_tree = parse_playlist_tree(root, tracks, track_lookup)
+
+            def to_json(nodes, path=()):
+                result = []
+                for node in nodes:
+                    node_path = path + (node['name'],)
+                    if node.get('type') == 'folder' or 'children' in node:
+                        children = to_json(node.get('children', []), node_path)
+                        total = sum(
+                            c['track_count'] if c['type'] == 'playlist'
+                            else c.get('total_tracks', 0)
+                            for c in children
+                        )
+                        result.append({
+                            "id": _make_id('/'.join(node_path)),
+                            "name": node['name'],
+                            "type": "folder",
+                            "children": children,
+                            "total_tracks": total
+                        })
+                    else:
+                        keys = node.get('keys', [])
+                        is_smart = node.get('smart', False)
+                        result.append({
+                            "id": _make_id('/'.join(node_path)),
+                            "name": node['name'],
+                            "type": "playlist",
+                            "track_count": len(keys),
+                            "smart": is_smart
+                        })
+                return result
+
+            def _make_id(s):
+                import zlib
+                return str(zlib.crc32(s.encode()) & 0xFFFFFFFF)
+
+            self.send_json(200, to_json(playlist_tree))
+        except Exception as e:
+            import traceback
+            self.send_json(500, {"error": str(e), "trace": traceback.format_exc()[-500:]})
 
     def detect_usb(self):
         """Check if a Pioneer USB drive is connected."""
@@ -534,6 +636,7 @@ HTML_TEMPLATE = """
         
         <div class="tabs">
             <button class="tab-button active" onclick="switchTab('sync-tab', this)">📦 Library Sync</button>
+            <button class="tab-button" onclick="switchTab('traktor-tab', this)">🎵 Traktor → Rekordbox</button>
             <button class="tab-button" onclick="switchTab('history-tab', this)">📜 Import History</button>
         </div>
         
@@ -608,6 +711,49 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
+        <!-- TRAKTOR → REKORDBOX TAB -->
+        <div class="tab-content" id="traktor-tab">
+            <div class="panel">
+                <div class="section">
+                    <div class="section-title">🎵 Sync Traktor Playlists → Rekordbox</div>
+                    <p style="color:#888; font-size:0.9em; margin:0 0 16px 0;">
+                        Reads your Traktor collection directly and writes to Rekordbox's master.db — no need to open Rekordbox or import an XML file.
+                        Smartlists (⚡) are evaluated and synced as regular playlists.
+                    </p>
+                    <div class="option-group">
+                        <label>
+                            <input type="radio" name="traktor-selection" value="all" checked>
+                            Entire Traktor library
+                        </label>
+                        <label>
+                            <input type="radio" name="traktor-selection" value="playlists">
+                            Pick playlists
+                        </label>
+                    </div>
+                    <div id="traktor-playlist-tree" style="display:none; max-height:450px; overflow-y:auto; margin-top:10px; padding:8px; border:1px solid #333; border-radius:8px; background:#1a1a1a;">
+                        <div style="text-align:center; color:#888;">Loading Traktor playlists...</div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">⚙️ Options</div>
+                    <div class="option-group">
+                        <label>
+                            <input type="checkbox" id="traktor-dry-run">
+                            Preview only (don't write to Rekordbox)
+                        </label>
+                    </div>
+                </div>
+
+                <div class="buttons">
+                    <button class="btn-primary" onclick="startTraktorSync()">Sync to Rekordbox</button>
+                    <button class="btn-secondary" onclick="resetTraktorForm()">Reset</button>
+                </div>
+
+                <div class="status" id="traktor-status"></div>
+            </div>
+        </div>
+
         <!-- HISTORY TAB -->
         <div class="tab-content" id="history-tab">
             <div class="panel">
@@ -653,6 +799,10 @@ HTML_TEMPLATE = """
             
             if (tabId === 'history-tab') {
                 loadHistoryPlaylists();
+            }
+            if (tabId === 'traktor-tab') {
+                // auto-wire radios on first switch
+                initTraktorTab();
             }
         }
         
@@ -1202,6 +1352,203 @@ HTML_TEMPLATE = """
             document.getElementById('history-name').value = '';
             document.getElementById('history-status').className = 'status';
             document.getElementById('history-status').innerHTML = '';
+        }
+
+        // ── TRAKTOR → REKORDBOX TAB ──────────────────────────────────────
+        var traktorTabInited = false;
+        var traktorPlaylistData = [];
+        var traktorTree = document.getElementById('traktor-playlist-tree');
+
+        function initTraktorTab() {
+            if (traktorTabInited) return;
+            traktorTabInited = true;
+            document.querySelectorAll('input[name="traktor-selection"]').forEach(function(r) {
+                r.addEventListener('change', function() {
+                    var sel = document.querySelector('input[name="traktor-selection"]:checked').value;
+                    traktorTree.style.display = sel === 'playlists' ? 'block' : 'none';
+                    if (sel === 'playlists' && !traktorTree.dataset.loaded) {
+                        loadTraktorPlaylists();
+                    }
+                });
+            });
+        }
+
+        function loadTraktorPlaylists() {
+            traktorTree.innerHTML = '<div style="text-align:center; color:#888;">Reading collection.nml... (may take a few seconds)</div>';
+            fetch('/api/traktor-playlists')
+                .then(function(r) { return r.json(); })
+                .then(function(tree) {
+                    if (tree.error) {
+                        traktorTree.innerHTML = '<div style="color:#e57373;">Error: ' + escapeHtml(tree.error) + '</div>';
+                        return;
+                    }
+                    traktorPlaylistData = tree;
+                    traktorTree.innerHTML = '';
+                    traktorTree.dataset.loaded = 'true';
+                    renderTraktorTree(tree, traktorTree);
+                })
+                .catch(function(e) {
+                    traktorTree.innerHTML = '<div style="color:#e57373;">Error: ' + escapeHtml(e.message || String(e)) + '</div>';
+                });
+        }
+
+        function renderTraktorTree(nodes, container) {
+            nodes.forEach(function(node) {
+                if (node.type === 'folder') {
+                    var folderDiv = document.createElement('div');
+                    var header = document.createElement('div');
+                    header.className = 'tree-folder-row';
+
+                    var arrow = document.createElement('span');
+                    arrow.className = 'folder-arrow';
+                    arrow.textContent = '▶';
+                    arrow.addEventListener('click', function() { toggleTraktorFolder(header); });
+
+                    var cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.className = 'tree-folder-cb';
+                    cb.value = node.name;
+                    cb.dataset.id = node.id;
+                    cb.dataset.type = 'folder';
+
+                    var lbl = document.createElement('span');
+                    lbl.className = 'folder-name';
+                    lbl.textContent = '📁 ' + node.name;
+                    lbl.addEventListener('click', function() { toggleTraktorFolder(header); });
+
+                    var count = document.createElement('span');
+                    count.className = 'tree-count';
+                    count.textContent = '(' + (node.total_tracks || 0) + ')';
+
+                    var children = document.createElement('div');
+                    children.className = 'tree-children collapsed';
+                    renderTraktorTree(node.children || [], children);
+
+                    cb.addEventListener('change', function() {
+                        setSubtreeChecked(children, cb.checked);
+                        updateAncestorFolderStates(cb);
+                    });
+
+                    header.appendChild(arrow);
+                    header.appendChild(cb);
+                    header.appendChild(lbl);
+                    header.appendChild(count);
+                    folderDiv.appendChild(header);
+                    folderDiv.appendChild(children);
+                    container.appendChild(folderDiv);
+                } else {
+                    var div = document.createElement('div');
+                    var isSmartlist = node.smart;
+                    div.className = 'tree-playlist';
+
+                    var cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.value = node.name;
+                    cb.dataset.id = node.id;
+                    cb.dataset.type = 'playlist';
+                    cb.addEventListener('change', function() { updateAncestorFolderStates(cb); });
+
+                    var lbl = document.createElement('label');
+                    lbl.textContent = (isSmartlist ? '⚡ ' : '') + node.name;
+                    lbl.title = isSmartlist ? 'Smartlist (auto-evaluated)' : '';
+                    lbl.addEventListener('click', function(evt) {
+                        evt.preventDefault();
+                        cb.checked = !cb.checked;
+                        cb.dispatchEvent(new Event('change'));
+                    });
+
+                    var count = document.createElement('span');
+                    count.className = 'tree-count';
+                    count.textContent = '(' + node.track_count + ')';
+
+                    div.appendChild(cb);
+                    div.appendChild(lbl);
+                    div.appendChild(count);
+                    container.appendChild(div);
+                }
+            });
+        }
+
+        function toggleTraktorFolder(header) {
+            var children = header.nextElementSibling;
+            var arrow = header.querySelector('.folder-arrow');
+            children.classList.toggle('collapsed');
+            arrow.textContent = children.classList.contains('collapsed') ? '▶' : '▼';
+        }
+
+        function getTraktorCheckedNames() {
+            // Walk the live DOM — same dedup logic as getCheckedSelectionNames
+            function walk(container) {
+                var names = [];
+                var directChildren = Array.from(container.children);
+                for (var i = 0; i < directChildren.length; i++) {
+                    var child = directChildren[i];
+                    var header = child.querySelector(':scope > .tree-folder-row');
+                    if (header) {
+                        var cb = header.querySelector('.tree-folder-cb');
+                        if (cb && cb.checked && !cb.indeterminate) {
+                            names.push(cb.value);
+                        } else if (cb && (cb.indeterminate || cb.checked)) {
+                            var subContainer = child.querySelector(':scope > .tree-children');
+                            if (subContainer) names = names.concat(walk(subContainer));
+                        }
+                    } else {
+                        var pCb = child.querySelector('input[type="checkbox"]');
+                        if (pCb && pCb.checked) names.push(pCb.value);
+                    }
+                }
+                return names;
+            }
+            return walk(traktorTree);
+        }
+
+        function startTraktorSync() {
+            var sel = document.querySelector('input[name="traktor-selection"]:checked').value;
+            var dryRun = document.getElementById('traktor-dry-run').checked;
+            var playlists = sel === 'playlists' ? getTraktorCheckedNames() : [];
+
+            if (sel === 'playlists' && playlists.length === 0) {
+                alert('Please select at least one playlist or folder.');
+                return;
+            }
+
+            var status = document.getElementById('traktor-status');
+            status.className = 'status loading';
+            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>'
+                + (dryRun ? 'Previewing...' : 'Syncing Traktor → Rekordbox...');
+
+            fetch('/api/traktor-sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ selection: sel, playlists: playlists, dry_run: dryRun })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.success) {
+                    status.className = 'status success';
+                    status.innerHTML = '✅ ' + (dryRun ? 'Preview complete' : 'Sync complete')
+                        + '<br><pre style="font-size:0.8em; white-space:pre-wrap;">'
+                        + escapeHtml(data.stdout || '') + '</pre>';
+                } else {
+                    status.className = 'status error';
+                    status.innerHTML = '❌ Failed:<br><pre style="font-size:0.8em; white-space:pre-wrap;">'
+                        + escapeHtml(data.error || data.stderr || data.stdout || '') + '</pre>';
+                }
+            })
+            .catch(function(e) {
+                status.className = 'status error';
+                status.innerHTML = '❌ Error: ' + escapeHtml(e.message);
+            });
+        }
+
+        function resetTraktorForm() {
+            document.querySelectorAll('input[name="traktor-selection"]').forEach(function(r) {
+                r.checked = r.value === 'all';
+            });
+            traktorTree.style.display = 'none';
+            document.getElementById('traktor-dry-run').checked = false;
+            document.getElementById('traktor-status').className = 'status';
+            document.getElementById('traktor-status').innerHTML = '';
         }
     </script>
 </body>
