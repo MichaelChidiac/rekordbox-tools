@@ -98,6 +98,13 @@ def ts():
     now = datetime.datetime.now(datetime.timezone.utc)
     return now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond//1000:03d} +00:00'
 
+def safe_copy(src, dst):
+    """Copy file to USB, falling back to shutil.copy if copy2 fails (FAT32 chflags)."""
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        shutil.copy(src, dst)
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -111,11 +118,12 @@ def to_hex(n):
     return format(int(n), 'X').upper()
 
 def open_db(path, key=KEY):
-    con = sqlite3.connect(str(path))
+    con = sqlite3.connect(str(path), timeout=30)
     con.execute(f"PRAGMA key='{key}'")
     con.execute("PRAGMA cipher='sqlcipher'")
     con.execute("PRAGMA legacy=4")
     con.execute("PRAGMA foreign_keys=OFF")
+    con.execute("PRAGMA busy_timeout=30000")
     return con
 
 # ── Auto-detect USB ────────────────────────────────────────────────────────────
@@ -168,97 +176,149 @@ def wipe_usb(usb_path: Path, dry_run: bool = False):
     print(f"\n✅ USB wiped. Ready for fresh export.")
     return True
 
-# ── Schema ─────────────────────────────────────────────────────────────────────
+# ── Schema — full Rekordbox 6 schema from master.db ────────────────────────────
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS djmdContent (
-    ID VARCHAR(255) PRIMARY KEY, FolderPath VARCHAR(255), FileNameL VARCHAR(255),
-    Title VARCHAR(255), ArtistID VARCHAR(255), BPM INTEGER, Length INTEGER,
-    FileType INTEGER DEFAULT 1, BitRate INTEGER, SampleRate INTEGER,
-    Commnt VARCHAR(255), Rating INTEGER DEFAULT 0, ColorID INTEGER DEFAULT 0,
-    KeyID INTEGER, UUID VARCHAR(255),
-    rb_data_status INTEGER DEFAULT 257,
-    rb_local_data_status INTEGER DEFAULT 0, rb_local_deleted TINYINT DEFAULT 0,
-    rb_local_synced TINYINT DEFAULT 0, rb_local_usn BIGINT,
-    created_at DATETIME, updated_at DATETIME
-);
-CREATE TABLE IF NOT EXISTS djmdArtist (
-    ID VARCHAR(255) PRIMARY KEY, Name VARCHAR(255), UUID VARCHAR(255),
-    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
-    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
-    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
-);
-CREATE TABLE IF NOT EXISTS djmdPlaylist (
-    ID VARCHAR(255) PRIMARY KEY, Seq INTEGER, Name VARCHAR(255),
-    Attribute INTEGER DEFAULT 0, ParentID VARCHAR(255) DEFAULT 'root',
-    SmartList TEXT, UUID VARCHAR(255),
-    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
-    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
-    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
-);
-CREATE TABLE IF NOT EXISTS djmdSongPlaylist (
-    ID VARCHAR(255) PRIMARY KEY, PlaylistID VARCHAR(255), ContentID VARCHAR(255),
-    TrackNo INTEGER, UUID VARCHAR(255),
-    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
-    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
-    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
-);
-CREATE TABLE IF NOT EXISTS djmdCue (
-    ID VARCHAR(255) PRIMARY KEY, ContentID VARCHAR(255),
-    InMsec INTEGER, InFrame INTEGER DEFAULT 0, InMpegFrame INTEGER DEFAULT 0,
-    InMpegAbs INTEGER DEFAULT 0, OutMsec INTEGER DEFAULT -1,
-    OutFrame INTEGER DEFAULT 0, OutMpegFrame INTEGER DEFAULT 0,
-    OutMpegAbs INTEGER DEFAULT 0, Kind INTEGER DEFAULT 0,
-    Color INTEGER DEFAULT -1, ColorTableIndex INTEGER DEFAULT -1,
-    ActiveLoop INTEGER DEFAULT 0, Comment VARCHAR(255),
-    BeatLoopSize INTEGER DEFAULT 0, CueMicrosec INTEGER DEFAULT 0,
-    ContentUUID VARCHAR(255), UUID VARCHAR(255),
-    rb_data_status INTEGER DEFAULT 0, rb_local_data_status INTEGER DEFAULT 0,
-    rb_local_deleted TINYINT DEFAULT 0, rb_local_synced TINYINT DEFAULT 0,
-    rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
-);
-CREATE TABLE IF NOT EXISTS djmdKey (
-    ID INTEGER PRIMARY KEY, ScaleName VARCHAR(255), Seq INTEGER
-);
-CREATE TABLE IF NOT EXISTS djmdColor (
-    ID INTEGER PRIMARY KEY, ColorCode INTEGER, SortKey INTEGER, Name VARCHAR(255)
-);
-CREATE TABLE IF NOT EXISTS djmdProperty (
-    DBID VARCHAR(255) PRIMARY KEY, DeviceID VARCHAR(255), LocalPath VARCHAR(255),
-    UUID VARCHAR(255), rb_local_usn BIGINT, created_at DATETIME, updated_at DATETIME
-);
+CREATE TABLE IF NOT EXISTS `agentNotification` (`ID` BIGINT PRIMARY KEY, `graphic_area` TINYINT(1) DEFAULT 0, `text_area` TINYINT(1) DEFAULT 0, `os_notification` TINYINT(1) DEFAULT 0, `start_datetime` DATETIME DEFAULT NULL, `end_datetime` DATETIME DEFAULT NULL, `display_datetime` DATETIME DEFAULT NULL, `interval` INTEGER DEFAULT 0, `category` VARCHAR(255) DEFAULT NULL, `category_color` VARCHAR(255) DEFAULT NULL, `title` TEXT DEFAULT NULL, `description` TEXT DEFAULT NULL, `url` VARCHAR(255) DEFAULT NULL, `image` VARCHAR(255) DEFAULT NULL, `image_path` VARCHAR(255) DEFAULT NULL, `read_status` INTEGER DEFAULT 0, `last_displayed_datetime` DATETIME DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `agentNotificationLog` (`ID` INTEGER PRIMARY KEY AUTOINCREMENT, `gigya_uid` VARCHAR(255) DEFAULT NULL, `event_date` INTEGER DEFAULT NULL, `reported_datetime` DATETIME DEFAULT NULL, `kind` INTEGER DEFAULT NULL, `value` INTEGER DEFAULT NULL, `notification_id` BIGINT DEFAULT NULL, `link` VARCHAR(255) DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `agentRegistry` (`registry_id` VARCHAR(255) PRIMARY KEY, `id_1` VARCHAR(255) DEFAULT NULL, `id_2` VARCHAR(255) DEFAULT NULL, `int_1` BIGINT DEFAULT NULL, `int_2` BIGINT DEFAULT NULL, `str_1` VARCHAR(255) DEFAULT NULL, `str_2` VARCHAR(255) DEFAULT NULL, `date_1` DATETIME DEFAULT NULL, `date_2` DATETIME DEFAULT NULL, `text_1` TEXT DEFAULT NULL, `text_2` TEXT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `cloudAgentRegistry` (`ID` VARCHAR(255) PRIMARY KEY, `int_1` BIGINT DEFAULT NULL, `int_2` BIGINT DEFAULT NULL, `str_1` VARCHAR(255) DEFAULT NULL, `str_2` VARCHAR(255) DEFAULT NULL, `date_1` DATETIME DEFAULT NULL, `date_2` DATETIME DEFAULT NULL, `text_1` TEXT DEFAULT NULL, `text_2` TEXT DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `contentActiveCensor` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `ActiveCensors` TEXT DEFAULT NULL, `rb_activecensor_count` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `contentCue` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `Cues` TEXT DEFAULT NULL, `rb_cue_count` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `contentFile` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `Path` VARCHAR(255) DEFAULT NULL, `Hash` VARCHAR(255) DEFAULT NULL, `Size` INTEGER DEFAULT NULL, `rb_local_path` VARCHAR(255) DEFAULT NULL, `rb_insync_hash` VARCHAR(255) DEFAULT NULL, `rb_insync_local_usn` BIGINT DEFAULT NULL, `rb_file_hash_dirty` INTEGER DEFAULT 0, `rb_local_file_status` INTEGER DEFAULT 0, `rb_in_progress` TINYINT(1) DEFAULT 0, `rb_process_type` INTEGER DEFAULT 0, `rb_temp_path` VARCHAR(255) DEFAULT NULL, `rb_priority` INTEGER DEFAULT 50, `rb_file_size_dirty` INTEGER DEFAULT 0, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdActiveCensor` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `InMsec` INTEGER DEFAULT NULL, `OutMsec` INTEGER DEFAULT NULL, `Info` INTEGER DEFAULT NULL, `ParameterList` TEXT DEFAULT NULL, `ContentUUID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdAlbum` (`ID` VARCHAR(255) PRIMARY KEY, `Name` VARCHAR(255) DEFAULT NULL, `AlbumArtistID` VARCHAR(255) DEFAULT NULL, `ImagePath` VARCHAR(255) DEFAULT NULL, `Compilation` INTEGER DEFAULT NULL, `SearchStr` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdArtist` (`ID` VARCHAR(255) PRIMARY KEY, `Name` VARCHAR(255) DEFAULT NULL, `SearchStr` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdCategory` (`ID` VARCHAR(255) PRIMARY KEY, `MenuItemID` VARCHAR(255) DEFAULT NULL, `Seq` INTEGER DEFAULT NULL, `Disable` INTEGER DEFAULT NULL, `InfoOrder` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdCloudProperty` (`ID` VARCHAR(255) PRIMARY KEY, `Reserved1` TEXT DEFAULT NULL, `Reserved2` TEXT DEFAULT NULL, `Reserved3` TEXT DEFAULT NULL, `Reserved4` TEXT DEFAULT NULL, `Reserved5` TEXT DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdColor` (`ID` VARCHAR(255) PRIMARY KEY, `ColorCode` INTEGER DEFAULT NULL, `SortKey` INTEGER DEFAULT NULL, `Commnt` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdContent` (`ID` VARCHAR(255) PRIMARY KEY, `FolderPath` VARCHAR(255) DEFAULT NULL, `FileNameL` VARCHAR(255) DEFAULT NULL, `FileNameS` VARCHAR(255) DEFAULT NULL, `Title` VARCHAR(255) DEFAULT NULL, `ArtistID` VARCHAR(255) DEFAULT NULL, `AlbumID` VARCHAR(255) DEFAULT NULL, `GenreID` VARCHAR(255) DEFAULT NULL, `BPM` INTEGER DEFAULT NULL, `Length` INTEGER DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `BitRate` INTEGER DEFAULT NULL, `BitDepth` INTEGER DEFAULT NULL, `Commnt` TEXT DEFAULT NULL, `FileType` INTEGER DEFAULT NULL, `Rating` INTEGER DEFAULT NULL, `ReleaseYear` INTEGER DEFAULT NULL, `RemixerID` VARCHAR(255) DEFAULT NULL, `LabelID` VARCHAR(255) DEFAULT NULL, `OrgArtistID` VARCHAR(255) DEFAULT NULL, `KeyID` VARCHAR(255) DEFAULT NULL, `StockDate` VARCHAR(255) DEFAULT NULL, `ColorID` VARCHAR(255) DEFAULT NULL, `DJPlayCount` INTEGER DEFAULT NULL, `ImagePath` VARCHAR(255) DEFAULT NULL, `MasterDBID` VARCHAR(255) DEFAULT NULL, `MasterSongID` VARCHAR(255) DEFAULT NULL, `AnalysisDataPath` VARCHAR(255) DEFAULT NULL, `SearchStr` VARCHAR(255) DEFAULT NULL, `FileSize` INTEGER DEFAULT NULL, `DiscNo` INTEGER DEFAULT NULL, `ComposerID` VARCHAR(255) DEFAULT NULL, `Subtitle` VARCHAR(255) DEFAULT NULL, `SampleRate` INTEGER DEFAULT NULL, `DisableQuantize` INTEGER DEFAULT NULL, `Analysed` INTEGER DEFAULT NULL, `ReleaseDate` VARCHAR(255) DEFAULT NULL, `DateCreated` VARCHAR(255) DEFAULT NULL, `ContentLink` INTEGER DEFAULT NULL, `Tag` VARCHAR(255) DEFAULT NULL, `ModifiedByRBM` VARCHAR(255) DEFAULT NULL, `HotCueAutoLoad` VARCHAR(255) DEFAULT NULL, `DeliveryControl` VARCHAR(255) DEFAULT NULL, `DeliveryComment` VARCHAR(255) DEFAULT NULL, `CueUpdated` VARCHAR(255) DEFAULT NULL, `AnalysisUpdated` VARCHAR(255) DEFAULT NULL, `TrackInfoUpdated` VARCHAR(255) DEFAULT NULL, `Lyricist` VARCHAR(255) DEFAULT NULL, `ISRC` VARCHAR(255) DEFAULT NULL, `SamplerTrackInfo` INTEGER DEFAULT NULL, `SamplerPlayOffset` INTEGER DEFAULT NULL, `SamplerGain` FLOAT DEFAULT NULL, `VideoAssociate` VARCHAR(255) DEFAULT NULL, `LyricStatus` INTEGER DEFAULT NULL, `ServiceID` INTEGER DEFAULT NULL, `OrgFolderPath` VARCHAR(255) DEFAULT NULL, `Reserved1` TEXT DEFAULT NULL, `Reserved2` TEXT DEFAULT NULL, `Reserved3` TEXT DEFAULT NULL, `Reserved4` TEXT DEFAULT NULL, `ExtInfo` TEXT DEFAULT NULL, `rb_file_id` VARCHAR(255) DEFAULT NULL, `DeviceID` VARCHAR(255) DEFAULT NULL, `rb_LocalFolderPath` VARCHAR(255) DEFAULT NULL, `SrcID` VARCHAR(255) DEFAULT NULL, `SrcTitle` VARCHAR(255) DEFAULT NULL, `SrcArtistName` VARCHAR(255) DEFAULT NULL, `SrcAlbumName` VARCHAR(255) DEFAULT NULL, `SrcLength` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdCue` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `InMsec` INTEGER DEFAULT NULL, `InFrame` INTEGER DEFAULT NULL, `InMpegFrame` INTEGER DEFAULT NULL, `InMpegAbs` INTEGER DEFAULT NULL, `OutMsec` INTEGER DEFAULT NULL, `OutFrame` INTEGER DEFAULT NULL, `OutMpegFrame` INTEGER DEFAULT NULL, `OutMpegAbs` INTEGER DEFAULT NULL, `Kind` INTEGER DEFAULT NULL, `Color` INTEGER DEFAULT NULL, `ColorTableIndex` INTEGER DEFAULT NULL, `ActiveLoop` INTEGER DEFAULT NULL, `Comment` VARCHAR(255) DEFAULT NULL, `BeatLoopSize` INTEGER DEFAULT NULL, `CueMicrosec` INTEGER DEFAULT NULL, `InPointSeekInfo` VARCHAR(255) DEFAULT NULL, `OutPointSeekInfo` VARCHAR(255) DEFAULT NULL, `ContentUUID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdDevice` (`ID` VARCHAR(255) PRIMARY KEY, `MasterDBID` VARCHAR(255) DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdGenre` (`ID` VARCHAR(255) PRIMARY KEY, `Name` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdHistory` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `DateCreated` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdHotCueBanklist` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `ImagePath` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdKey` (`ID` VARCHAR(255) PRIMARY KEY, `ScaleName` VARCHAR(255) DEFAULT NULL, `Seq` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdLabel` (`ID` VARCHAR(255) PRIMARY KEY, `Name` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdMenuItems` (`ID` VARCHAR(255) PRIMARY KEY, `Class` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdMixerParam` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `GainHigh` INTEGER DEFAULT NULL, `GainLow` INTEGER DEFAULT NULL, `PeakHigh` INTEGER DEFAULT NULL, `PeakLow` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdMyTag` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdPlaylist` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `ImagePath` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `SmartList` TEXT DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdProperty` (`DBID` VARCHAR(255) PRIMARY KEY, `DBVersion` VARCHAR(255) DEFAULT NULL, `BaseDBDrive` VARCHAR(255) DEFAULT NULL, `CurrentDBDrive` VARCHAR(255) DEFAULT NULL, `DeviceID` VARCHAR(255) DEFAULT NULL, `Reserved1` TEXT DEFAULT NULL, `Reserved2` TEXT DEFAULT NULL, `Reserved3` TEXT DEFAULT NULL, `Reserved4` TEXT DEFAULT NULL, `Reserved5` TEXT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdRecommendLike` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID1` VARCHAR(255) DEFAULT NULL, `ContentID2` VARCHAR(255) DEFAULT NULL, `LikeRate` INTEGER DEFAULT NULL, `DataCreatedH` INTEGER DEFAULT NULL, `DataCreatedL` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdRelatedTracks` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `Criteria` TEXT DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSampler` (`ID` VARCHAR(255) PRIMARY KEY, `Seq` INTEGER DEFAULT NULL, `Name` VARCHAR(255) DEFAULT NULL, `Attribute` INTEGER DEFAULT NULL, `ParentID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSharedPlaylist` (`ID` VARCHAR(255) PRIMARY KEY, `data_selection` TINYINT DEFAULT 0, `edited_at` DATETIME DEFAULT NULL, `int_1` INTEGER DEFAULT NULL, `int_2` INTEGER DEFAULT NULL, `str_1` VARCHAR(255) DEFAULT NULL, `str_2` VARCHAR(255) DEFAULT NULL, `text_1` TEXT DEFAULT NULL, `text_2` TEXT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSharedPlaylistUser` (`ID` VARCHAR(255) NOT NULL, `member_type` TINYINT DEFAULT 0, `member_id` VARCHAR(255) NOT NULL, `status` TINYINT DEFAULT 0, `invitation_expires_at` DATETIME DEFAULT NULL, `invited_at` DATETIME DEFAULT NULL, `joined_at` DATETIME DEFAULT NULL, `int_1` INTEGER DEFAULT NULL, `int_2` INTEGER DEFAULT NULL, `str_1` VARCHAR(255) DEFAULT NULL, `str_2` VARCHAR(255) DEFAULT NULL, `text_1` TEXT DEFAULT NULL, `text_2` TEXT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, PRIMARY KEY (`ID`, `member_id`));
+CREATE TABLE IF NOT EXISTS `djmdSongHistory` (`ID` VARCHAR(255) PRIMARY KEY, `HistoryID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongHotCueBanklist` (`ID` VARCHAR(255) PRIMARY KEY, `HotCueBanklistID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `CueID` VARCHAR(255) DEFAULT NULL, `InMsec` INTEGER DEFAULT NULL, `InFrame` INTEGER DEFAULT NULL, `InMpegFrame` INTEGER DEFAULT NULL, `InMpegAbs` INTEGER DEFAULT NULL, `OutMsec` INTEGER DEFAULT NULL, `OutFrame` INTEGER DEFAULT NULL, `OutMpegFrame` INTEGER DEFAULT NULL, `OutMpegAbs` INTEGER DEFAULT NULL, `Color` INTEGER DEFAULT NULL, `ColorTableIndex` INTEGER DEFAULT NULL, `ActiveLoop` INTEGER DEFAULT NULL, `Comment` VARCHAR(255) DEFAULT NULL, `BeatLoopSize` INTEGER DEFAULT NULL, `CueMicrosec` INTEGER DEFAULT NULL, `InPointSeekInfo` VARCHAR(255) DEFAULT NULL, `OutPointSeekInfo` VARCHAR(255) DEFAULT NULL, `HotCueBanklistUUID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongMyTag` (`ID` VARCHAR(255) PRIMARY KEY, `MyTagID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongPlaylist` (`ID` VARCHAR(255) PRIMARY KEY, `PlaylistID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongRelatedTracks` (`ID` VARCHAR(255) PRIMARY KEY, `RelatedTracksID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongSampler` (`ID` VARCHAR(255) PRIMARY KEY, `SamplerID` VARCHAR(255) DEFAULT NULL, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSongTagList` (`ID` VARCHAR(255) PRIMARY KEY, `ContentID` VARCHAR(255) DEFAULT NULL, `TrackNo` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `djmdSort` (`ID` VARCHAR(255) PRIMARY KEY, `MenuItemID` VARCHAR(255) DEFAULT NULL, `Seq` INTEGER DEFAULT NULL, `Disable` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `hotCueBanklistCue` (`ID` VARCHAR(255) PRIMARY KEY, `HotCueBanklistID` VARCHAR(255) DEFAULT NULL, `Cues` TEXT DEFAULT NULL, `rb_cue_count` INTEGER DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `imageFile` (`ID` VARCHAR(255) PRIMARY KEY, `TableName` VARCHAR(255) DEFAULT NULL, `TargetUUID` VARCHAR(255) DEFAULT NULL, `TargetID` VARCHAR(255) DEFAULT NULL, `Path` VARCHAR(255) DEFAULT NULL, `Hash` VARCHAR(255) DEFAULT NULL, `Size` INTEGER DEFAULT NULL, `rb_local_path` VARCHAR(255) DEFAULT NULL, `rb_insync_hash` VARCHAR(255) DEFAULT NULL, `rb_insync_local_usn` BIGINT DEFAULT NULL, `rb_file_hash_dirty` INTEGER DEFAULT 0, `rb_local_file_status` INTEGER DEFAULT 0, `rb_in_progress` TINYINT(1) DEFAULT 0, `rb_process_type` INTEGER DEFAULT 0, `rb_temp_path` VARCHAR(255) DEFAULT NULL, `rb_priority` INTEGER DEFAULT 50, `rb_file_size_dirty` INTEGER DEFAULT 0, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `settingFile` (`ID` VARCHAR(255) PRIMARY KEY, `Path` VARCHAR(255) DEFAULT NULL, `Hash` VARCHAR(255) DEFAULT NULL, `Size` INTEGER DEFAULT NULL, `rb_local_path` VARCHAR(255) DEFAULT NULL, `rb_insync_hash` VARCHAR(255) DEFAULT NULL, `rb_insync_local_usn` BIGINT DEFAULT NULL, `rb_file_hash_dirty` INTEGER DEFAULT 0, `rb_file_size_dirty` INTEGER DEFAULT 0, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS `uuidIDMap` (`ID` VARCHAR(255) PRIMARY KEY, `TableName` VARCHAR(255) DEFAULT NULL, `TargetUUID` VARCHAR(255) DEFAULT NULL, `CurrentID` VARCHAR(255) DEFAULT NULL, `UUID` VARCHAR(255) DEFAULT NULL, `rb_data_status` INTEGER DEFAULT 0, `rb_local_data_status` INTEGER DEFAULT 0, `rb_local_deleted` TINYINT(1) DEFAULT 0, `rb_local_synced` TINYINT(1) DEFAULT 0, `usn` BIGINT DEFAULT NULL, `rb_local_usn` BIGINT DEFAULT NULL, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL);
 """
 
 def init_usb_db(usb_con, usb_path: Path):
     usb_con.executescript(SCHEMA_SQL)
     master = open_db(MASTER_DB)
-    for k in master.execute("SELECT ID, ScaleName, Seq FROM djmdKey").fetchall():
-        usb_con.execute("INSERT OR IGNORE INTO djmdKey VALUES (?,?,?)", k)
-    for c in master.execute("SELECT ID, ColorCode, SortKey, Commnt FROM djmdColor").fetchall():
-        usb_con.execute("INSERT OR IGNORE INTO djmdColor VALUES (?,?,?,?)", c)
+
+    # Copy djmdKey with full Rekordbox 6 schema
+    for k in master.execute(
+        "SELECT ID, ScaleName, Seq, UUID, rb_data_status, rb_local_data_status, "
+        "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at "
+        "FROM djmdKey"
+    ).fetchall():
+        usb_con.execute(
+            "INSERT OR IGNORE INTO djmdKey "
+            "(ID, ScaleName, Seq, UUID, rb_data_status, rb_local_data_status, "
+            "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", k)
+
+    # Copy djmdColor with full schema (includes UUID, rb_* status columns)
+    for c in master.execute(
+        "SELECT ID, ColorCode, SortKey, Commnt, UUID, rb_data_status, rb_local_data_status, "
+        "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at "
+        "FROM djmdColor"
+    ).fetchall():
+        usb_con.execute(
+            "INSERT OR IGNORE INTO djmdColor "
+            "(ID, ColorCode, SortKey, Commnt, UUID, rb_data_status, rb_local_data_status, "
+            "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", c)
+
+    # Copy djmdMenuItems from master.db
+    for m in master.execute(
+        "SELECT ID, Class, Name, UUID, rb_data_status, rb_local_data_status, "
+        "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at "
+        "FROM djmdMenuItems"
+    ).fetchall():
+        usb_con.execute(
+            "INSERT OR IGNORE INTO djmdMenuItems "
+            "(ID, Class, Name, UUID, rb_data_status, rb_local_data_status, "
+            "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", m)
+
+    # Copy djmdCategory from master.db
+    for cat in master.execute(
+        "SELECT ID, MenuItemID, Seq, Disable, InfoOrder, UUID, rb_data_status, rb_local_data_status, "
+        "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at "
+        "FROM djmdCategory"
+    ).fetchall():
+        usb_con.execute(
+            "INSERT OR IGNORE INTO djmdCategory "
+            "(ID, MenuItemID, Seq, Disable, InfoOrder, UUID, rb_data_status, rb_local_data_status, "
+            "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", cat)
+
     master.close()
-    db_id  = str(make_id(str(usb_path)))
-    dev_id = new_uuid()
+
+    db_id = str(make_id(str(usb_path)))
+    now = ts()
+
+    # djmdProperty — correct Rekordbox 6 schema
+    # Reserved1 is used to persist the last sync USN (see save_sync_usn)
     usb_con.execute(
-        "INSERT OR IGNORE INTO djmdProperty VALUES (?,?,?,?,1,?,?)",
-        (db_id, dev_id, '/', new_uuid(), ts(), ts()))
+        "INSERT OR IGNORE INTO djmdProperty "
+        "(DBID, DBVersion, BaseDBDrive, CurrentDBDrive, DeviceID, "
+        "Reserved1, Reserved2, Reserved3, Reserved4, Reserved5, created_at, updated_at) "
+        "VALUES (?, '6.8.5', '/', '/', ?, '', '', '', '', '', ?, ?)",
+        (db_id, new_uuid(), now, now))
+
+    # djmdDevice — register this USB as a known device
+    usb_con.execute(
+        "INSERT OR IGNORE INTO djmdDevice "
+        "(ID, MasterDBID, Name, UUID, rb_data_status, rb_local_data_status, "
+        "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 0, 0, 0, 0, 1, 1, ?, ?)",
+        (new_uuid(), db_id, usb_path.name, new_uuid(), now, now))
+
     usb_con.commit()
 
 # ── Sync state helpers ─────────────────────────────────────────────────────────
-SYNC_STATE_KEY = '_sync_state'
+# Sync USN is stored in djmdProperty.Reserved1 (the real schema has no rb_local_usn
+# on djmdProperty; Reserved1 is a TEXT field we repurpose for this).
 
 def get_last_sync_usn(usb_con) -> int:
-    """Return the max rb_local_usn from the previous sync, or 0 if first sync."""
-    r = usb_con.execute(
-        "SELECT rb_local_usn FROM djmdProperty WHERE DBID=?",
-        (SYNC_STATE_KEY,)
-    ).fetchone()
-    return int(r[0]) if r and r[0] is not None else 0
+    """Return the last synced USN (stored in djmdProperty.Reserved1), or 0 on first sync.
+    Falls back to 0 gracefully if the DB has an old schema (no Reserved1 column)."""
+    try:
+        row = usb_con.execute("SELECT Reserved1 FROM djmdProperty LIMIT 1").fetchone()
+        if row and row[0]:
+            return int(row[0])
+    except Exception:
+        pass
+    return 0
 
 def save_sync_usn(usb_con, usn: int):
+    """Persist the highest master.db USN seen during this sync into djmdProperty.Reserved1."""
     usb_con.execute(
-        "INSERT OR REPLACE INTO djmdProperty (DBID,DeviceID,LocalPath,UUID,rb_local_usn,created_at,updated_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (SYNC_STATE_KEY, '', '', new_uuid(), usn, ts(), ts()))
+        "UPDATE djmdProperty SET Reserved1=? WHERE DBID IS NOT NULL",
+        (str(usn),))
     usb_con.commit()
 
 # ── Playlist tree ──────────────────────────────────────────────────────────────
@@ -547,6 +607,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         init_usb_db(usb_con, usb_path)
 
     usn = 1  # USN to stamp all our writes with
+    usb_db_id = str(make_id(str(usb_path)))  # This USB's DBID (matches djmdProperty.DBID)
 
     # ── Artist cache ──────────────────────────────────────────────────────────
     artist_cache = {}
@@ -557,10 +618,10 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             return artist_cache[name]
         aid = str(make_id(f"artist:{name}"))
         usb_con.execute("""INSERT OR IGNORE INTO djmdArtist
-            (ID,Name,UUID,rb_data_status,rb_local_data_status,rb_local_deleted,
-             rb_local_synced,rb_local_usn,created_at,updated_at)
-            VALUES (?,?,?,0,0,0,0,?,?,?)""",
-            (aid, name, new_uuid(), usn, ts(), ts()))
+            (ID, Name, SearchStr, UUID, rb_data_status, rb_local_data_status,
+             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+            VALUES (?,?,?,?,0,0,0,0,?,?,?,?)""",
+            (aid, name, name, new_uuid(), usn, usn, ts(), ts()))
         artist_cache[name] = aid
         return aid
 
@@ -599,7 +660,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             dst_dir.mkdir(exist_ok=True)
             dst_audio = dst_dir / filename
             if not dst_audio.exists():
-                shutil.copy2(src_audio, dst_audio)
+                safe_copy(src_audio, dst_audio)
                 copied_audio += 1
             else:
                 skipped_audio += 1
@@ -650,36 +711,71 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
                 dst_anlz = usb_anlz / Path(usb_anlz_path.lstrip('/'))
             dst_anlz.parent.mkdir(parents=True, exist_ok=True)
             if not dst_anlz.exists():
-                shutil.copy2(src, dst_anlz)
+                safe_copy(src, dst_anlz)
                 copied_anlz += 1
 
-        # DB: content
+        # DB: content — full Rekordbox 6 schema
         artist_id = get_or_insert_artist(artist_name)
+        file_name_s = Path(filename).stem if filename else ''
+        search_str  = f"{title or ''} {artist_name or ''}".strip()
+        # Use first ANLZ path if available for AnalysisDataPath
+        _anlz_entries = anlz_map.get(cid, [])
+        anlz_data_path = _anlz_entries[0][0] if _anlz_entries else ''
         usb_con.execute("""INSERT OR REPLACE INTO djmdContent (
-            ID,FolderPath,FileNameL,Title,ArtistID,BPM,Length,
-            FileType,BitRate,SampleRate,Commnt,Rating,ColorID,KeyID,
-            UUID,rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-            rb_local_usn,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,257,0,0,0,?,?,?)""",
-            (str(db_id), usb_audio_rel, filename, title or filename,
-             artist_id, bpm, length, ftype, bitrate, samplerate,
-             comment, rating, color_id, key_id,
-             track_uuid or new_uuid(), usn, ts(), ts()))
+            ID, FolderPath, FileNameL, FileNameS, Title, ArtistID, AlbumID, GenreID,
+            BPM, Length, TrackNo, BitRate, BitDepth, Commnt, FileType, Rating,
+            ReleaseYear, RemixerID, LabelID, OrgArtistID, KeyID, StockDate, ColorID,
+            DJPlayCount, ImagePath, MasterDBID, MasterSongID, AnalysisDataPath,
+            SearchStr, FileSize, DiscNo, ComposerID, Subtitle, SampleRate,
+            DisableQuantize, Analysed, ReleaseDate, DateCreated, ContentLink, Tag,
+            ModifiedByRBM, HotCueAutoLoad, DeliveryControl, DeliveryComment,
+            CueUpdated, AnalysisUpdated, TrackInfoUpdated, Lyricist, ISRC,
+            SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate,
+            LyricStatus, ServiceID, OrgFolderPath,
+            Reserved1, Reserved2, Reserved3, Reserved4, ExtInfo,
+            rb_file_id, DeviceID, rb_LocalFolderPath,
+            SrcID, SrcTitle, SrcArtistName, SrcAlbumName, SrcLength,
+            UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+            usn, rb_local_usn, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(db_id), usb_audio_rel, filename, file_name_s,
+             title or filename, artist_id, '', '',
+             bpm, length, 0, bitrate, 0, comment, ftype, rating or 0,
+             0, '', '', '', key_id, '', color_id,
+             0, '', usb_db_id, str(db_id), anlz_data_path or '',
+             search_str, 0, 0, '', '', samplerate,
+             0, 1, '', ts(), 0, '',
+             '', '', '', '', '', '', '', '', '',
+             0, 0, 0.0, '', 0, 0, '',
+             '', '', '', '', '',
+             '', '', '',
+             '', '', '', '', 0,
+             track_uuid or new_uuid(), 257, 0, 0, 0,
+             usn, usn, ts(), ts()))
 
         # DB: cues (replace on sync to pick up changes)
+        # master.db djmdCue column order (SELECT *):
+        #   0:ID 1:ContentID 2:InMsec 3:InFrame 4:InMpegFrame 5:InMpegAbs
+        #   6:OutMsec 7:OutFrame 8:OutMpegFrame 9:OutMpegAbs 10:Kind 11:Color
+        #   12:ColorTableIndex 13:ActiveLoop 14:Comment 15:BeatLoopSize 16:CueMicrosec
+        #   17:InPointSeekInfo 18:OutPointSeekInfo 19:ContentUUID 20:UUID
+        #   21:rb_data_status 22:rb_local_data_status 23:rb_local_deleted
+        #   24:rb_local_synced 25:usn 26:rb_local_usn 27:created_at 28:updated_at
         usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID=?", (str(db_id),))
         for cue in cues.get(cid, []):
             usb_con.execute("""INSERT OR IGNORE INTO djmdCue (
-                ID,ContentID,InMsec,InFrame,InMpegFrame,InMpegAbs,
-                OutMsec,OutFrame,OutMpegFrame,OutMpegAbs,Kind,Color,
-                ColorTableIndex,ActiveLoop,Comment,BeatLoopSize,CueMicrosec,
-                ContentUUID,UUID,rb_data_status,rb_local_data_status,
-                rb_local_deleted,rb_local_synced,rb_local_usn,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?)""",
+                ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs,
+                OutMsec, OutFrame, OutMpegFrame, OutMpegAbs, Kind, Color,
+                ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, CueMicrosec,
+                InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID,
+                rb_data_status, rb_local_data_status,
+                rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
                 (cue[0], str(db_id), cue[2], cue[3], cue[4], cue[5],
                  cue[6], cue[7], cue[8], cue[9], cue[10], cue[11],
                  cue[12], cue[13], cue[14], cue[15], cue[16],
-                 cue[17], cue[18], usn, ts(), ts()))
+                 cue[17], cue[18], cue[19], cue[20],
+                 usn, usn, ts(), ts()))
 
     print()  # newline after progress
     usb_con.commit()
