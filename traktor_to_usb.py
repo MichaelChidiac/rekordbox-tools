@@ -654,12 +654,20 @@ def main():
         # ── Resolve USB path ──────────────────────────────────────────────────────
         if args.usb:
             usb_path = Path(args.usb)
-            if not usb_path.exists():
+            if not usb_path.exists() and not args.dry_run:
                 ap.error(f"USB path not found: {usb_path}")
+            elif not usb_path.exists() and args.dry_run:
+                # For dry-run, use the path even if it doesn't exist
+                pass
         else:
             candidates = detect_pioneer_usbs()
             if not candidates:
-                ap.error("No Pioneer USB drive detected. Plug in your USB or use --usb PATH.")
+                if not args.dry_run:
+                    ap.error("No Pioneer USB drive detected. Plug in your USB or use --usb PATH.")
+                else:
+                    # For dry-run preview, use a placeholder path
+                    usb_path = Path("/Volumes/PIONEER")
+                    print(f"📋 DRY-RUN MODE: No USB detected. Previewing with placeholder: {usb_path}")
             elif len(candidates) == 1:
                 usb_path = candidates[0]
                 print(f"Auto-detected USB: {usb_path}")
