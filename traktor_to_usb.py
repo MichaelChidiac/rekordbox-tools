@@ -138,44 +138,25 @@ def wipe_usb(usb_path: Path, dry_run: bool = False):
     usb_anlz    = usb_path / PIONEER_DIR / "USBANLZ"
     audio_dir   = usb_path / AUDIO_DIR
 
-    targets = []
-    for d in [usb_rb_dir, usb_anlz, audio_dir]:
-        if d.exists():
-            size = 0
-            count = 0
-            for f in d.rglob('*'):
-                try:
-                    if f.is_file():
-                        size += f.stat().st_size
-                        count += 1
-                except OSError:
-                    pass
-            targets.append((d, count, size))
+    existing = [(d, d.relative_to(usb_path)) for d in [usb_rb_dir, usb_anlz, audio_dir] if d.exists()]
 
-    if not targets:
+    if not existing:
         print("Nothing to wipe — USB appears clean.")
         return True
 
     print(f"\n🗑️  Wipe USB: {usb_path.name}")
-    total_files = 0
-    total_bytes = 0
-    for d, count, size in targets:
-        mb = size / (1024 * 1024)
-        print(f"  {d.relative_to(usb_path)}: {count} files ({mb:.1f} MB)")
-        total_files += count
-        total_bytes += size
-
-    print(f"  Total: {total_files} files ({total_bytes / (1024*1024):.1f} MB)")
+    for d, rel in existing:
+        print(f"  Will delete: {rel}/")
 
     if dry_run:
         print("\n📋 DRY RUN — nothing deleted.")
         return True
 
     import shutil
-    for d, _, _ in targets:
+    for d, rel in existing:
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
-        print(f"  ✅ Wiped {d.relative_to(usb_path)}/")
+        print(f"  ✅ Wiped {rel}/")
 
     # Recreate empty DB structure so next export starts clean
     usb_db_path = usb_rb_dir / "exportLibrary.db"
