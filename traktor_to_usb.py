@@ -1100,6 +1100,26 @@ def main():
                 sys.exit(1)
 
         export_to_usb(usb_path, playlist_ids, tree, sync_mode, args.dry_run, args.fetch_nas)
+
+        # Generate export.pdb so Rekordbox desktop / CDJs can read the USB
+        try:
+            from write_pdb import read_export_db, build_pdb, backup_pdb
+            pdb_path = usb_path / "PIONEER" / "rekordbox" / "export.pdb"
+            db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
+            if db_path.exists():
+                print("\n🔨 Generating export.pdb ...")
+                pdb_data = read_export_db(db_path)
+                pdb_bytes = build_pdb(pdb_data)
+                if args.dry_run:
+                    print(f"  Would write {len(pdb_bytes):,} bytes to {pdb_path}")
+                else:
+                    if pdb_path.exists():
+                        backup_pdb(pdb_path)
+                    pdb_path.write_bytes(pdb_bytes)
+                    print(f"  ✅ Written {len(pdb_bytes):,} bytes ({len(pdb_bytes)//4096} pages)")
+        except Exception as e:
+            print(f"\n⚠️  export.pdb generation failed (USB still usable via exportLibrary.db): {e}")
+
         print("\n✅ Export completed successfully")
 
     except Exception as e:

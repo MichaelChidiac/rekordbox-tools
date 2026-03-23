@@ -429,13 +429,11 @@ class SyncHandler(BaseHTTPRequestHandler):
         return drives
 
     def get_usb_playlists(self, usb_path=None):
-        """Read playlists and tracks from a USB's exportLibrary.db."""
-        try:
-            import sqlcipher3
-        except ImportError:
-            self.send_json(500, {"error": "sqlcipher3 module not available"})
-            return
+        """Read playlists and tracks from a USB drive.
 
+        Tries exportLibrary.db (SQLCipher) first, falls back to export.pdb
+        (binary Pioneer format via Node.js rekordbox-parser).
+        """
         # Auto-detect USB if not specified
         if not usb_path:
             drives = self.detect_usb()
@@ -444,21 +442,40 @@ class SyncHandler(BaseHTTPRequestHandler):
                 return
             usb_path = drives[0]["path"]
 
+        # Try exportLibrary.db first (our tool's format)
         db_path = Path(usb_path) / "PIONEER" / "rekordbox" / "exportLibrary.db"
-        if not db_path.exists():
-            self.send_json(404, {"error": f"No exportLibrary.db found on {Path(usb_path).name}. "
-                                          "This USB may use the older export.pdb format only."})
+        if db_path.exists():
+            result = self._read_usb_sqlcipher(usb_path, db_path)
+            if result is not None:
+                self.send_json(200, result)
+                return
+            # SQLCipher failed (likely encrypted) — fall through to PDB
+
+        # Fallback: read export.pdb via Node.js
+        result = self._read_usb_pdb(usb_path)
+        if result is not None:
+            self.send_json(200, result)
             return
+
+        self.send_json(404, {
+            "error": f"No readable database found on {Path(usb_path).name}. "
+                     "Looked for export.pdb and exportLibrary.db."
+        })
+
+    def _read_usb_sqlcipher(self, usb_path, db_path):
+        """Try reading USB data from exportLibrary.db. Returns dict or None."""
+        try:
+            import sqlcipher3
+        except ImportError:
+            return None
 
         try:
             con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
             con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
             con.execute("PRAGMA cipher='sqlcipher'")
             con.execute("PRAGMA legacy=4")
-            # Verify we can actually read the DB
             con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
 
-            # Build playlist tree
             def build_tree(parent_id):
                 rows = con.execute(
                     "SELECT ID, Name, Attribute FROM djmdPlaylist "
@@ -482,7 +499,6 @@ class SyncHandler(BaseHTTPRequestHandler):
                             "SELECT COUNT(*) FROM djmdSongPlaylist WHERE PlaylistID=?",
                             (str(row_id),)
                         ).fetchone()[0]
-                        # Get track details
                         tracks = con.execute("""
                             SELECT c.Title, a.Name as Artist, c.BPM, c.Length
                             FROM djmdSongPlaylist sp
@@ -511,21 +527,88 @@ class SyncHandler(BaseHTTPRequestHandler):
             ).fetchone()[0]
             con.close()
 
-            self.send_json(200, {
+            return {
                 "usb_name": Path(usb_path).name,
                 "usb_path": usb_path,
+                "source": "exportLibrary.db",
                 "total_tracks": total_tracks,
                 "total_artists": total_artists,
                 "total_playlists": total_playlists,
                 "tree": tree
-            })
-        except Exception as e:
-            err_msg = str(e)
-            if "file is not a database" in err_msg:
-                err_msg = (f"Cannot read {Path(usb_path).name}'s database — "
-                           "it may use different encryption (Rekordbox-created USB exports "
-                           "use a device-specific key). Only USBs created by our tool can be browsed.")
-            self.send_json(500, {"error": err_msg})
+            }
+        except Exception:
+            return None
+
+    def _read_usb_pdb(self, usb_path):
+        """Read USB data from export.pdb via Node.js. Returns dict or None."""
+        pdb_candidates = [
+            Path(usb_path) / "PIONEER" / "rekordbox" / "export.pdb",
+            Path(usb_path) / ".PIONEER" / "rekordbox" / "export.pdb",
+        ]
+        pdb_path = None
+        for p in pdb_candidates:
+            if p.exists():
+                pdb_path = p
+                break
+        if not pdb_path:
+            return None
+
+        try:
+            script = Path(__file__).parent / "read_usb_pdb.js"
+            result = subprocess.run(
+                ["node", str(script), usb_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout)
+            if "error" in data:
+                return None
+
+            # Transform PDB tree format to match our web UI format
+            def transform_tree(nodes):
+                result = []
+                for node in nodes:
+                    if node.get("isFolder"):
+                        children = transform_tree(node.get("children", []))
+                        total = sum(
+                            n["track_count"] if n["type"] == "playlist"
+                            else n.get("total_tracks", 0) for n in children
+                        )
+                        result.append({
+                            "id": str(node["id"]), "name": node["name"],
+                            "type": "folder", "children": children,
+                            "total_tracks": total
+                        })
+                    else:
+                        tracks = node.get("tracks", [])
+                        track_list = [{
+                            "title": t.get("title", "Unknown"),
+                            "artist": t.get("artistName", "Unknown"),
+                            "bpm": round(t["tempo"] / 100, 1) if t.get("tempo") else None,
+                            "duration": t.get("duration", 0)
+                        } for t in tracks]
+                        result.append({
+                            "id": str(node["id"]), "name": node["name"],
+                            "type": "playlist", "track_count": len(tracks),
+                            "tracks": track_list
+                        })
+                return result
+
+            tree = transform_tree(data.get("tree", []))
+            summary = data.get("summary", {})
+
+            return {
+                "usb_name": Path(usb_path).name,
+                "usb_path": usb_path,
+                "source": "export.pdb",
+                "total_tracks": summary.get("tracks", 0),
+                "total_artists": summary.get("artists", 0),
+                "total_playlists": summary.get("playlists", 0),
+                "tree": tree
+            }
+        except Exception:
+            return None
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -1942,10 +2025,12 @@ HTML_TEMPLATE = """
 
                     // Summary
                     summaryEl.style.display = 'block';
+                    var sourceLabel = data.source === 'export.pdb' ? ' (via export.pdb)' : '';
                     document.getElementById('usb-summary-text').innerHTML =
                         '🎵 <strong>' + data.total_tracks + '</strong> tracks · ' +
                         '👤 <strong>' + data.total_artists + '</strong> artists · ' +
-                        '📋 <strong>' + data.total_playlists + '</strong> playlists';
+                        '📋 <strong>' + data.total_playlists + '</strong> playlists' +
+                        '<span style="color:#888; font-size:0.85em;">' + sourceLabel + '</span>';
 
                     // Build tree
                     treeEl.innerHTML = '';
