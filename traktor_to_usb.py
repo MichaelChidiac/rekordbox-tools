@@ -1399,7 +1399,14 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
     out.commit()
     # Switch to WAL mode (Rekordbox expects WAL journal mode)
     out.execute("PRAGMA journal_mode=wal")
+    # Checkpoint WAL to merge into main DB, then clean up WAL/SHM files
+    # FAT32 doesn't handle WAL files properly — they must not remain on disk
+    out.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     out.close()
+    for ext in ['-wal', '-shm']:
+        p = Path(str(output_path) + ext)
+        if p.exists():
+            p.unlink()
 
     out_size = os.path.getsize(output_path)
     print(f"  ✅ Device Library Plus: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries ({out_size:,} bytes)")
