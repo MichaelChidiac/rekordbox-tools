@@ -327,7 +327,7 @@ class PdbWriter:
           u16  magic           (0x03EC)
           u16  next_offset     (= num_entries)
           u32  page_index      (self-reference to header page)
-          u32  next_page       (first data page)
+          u32  next_page       (first data page, or 0x03FFFFFF if empty)
           u64  magic           (0x0000_0000_03FF_FFFF)
           u16  num_entries
           u16  first_empty     (0x1FFF = no empty slots)
@@ -340,9 +340,12 @@ class PdbWriter:
         Last 20 bytes of page: zeros (already zero from bytearray init).
         """
         EMPTY_ENTRY = 0x1FFF_FFF8
+        INDEX_PAGE_SENTINEL = 0x03FF_FFFF  # "no next page" marker
         MAX_ENTRIES = (PAGE_SIZE - 32 - 28 - 20) // 4  # 1004
 
         num_entries = min(len(data_page_indices), MAX_ENTRIES)
+        # Empty tables use sentinel value for next_page (matches Rekordbox reference)
+        next_page = data_page_indices[0] if data_page_indices else INDEX_PAGE_SENTINEL
         off = 0x20
 
         # IndexPageHeader (28 bytes)
@@ -351,7 +354,7 @@ class PdbWriter:
         struct.pack_into("<H", page, off + 4, 0x03EC)   # magic
         struct.pack_into("<H", page, off + 6, num_entries)  # next_offset
         struct.pack_into("<I", page, off + 8, header_page_idx)  # page_index
-        struct.pack_into("<I", page, off + 12, first_data_page_idx)  # next_page
+        struct.pack_into("<I", page, off + 12, next_page)  # next_page
         struct.pack_into("<Q", page, off + 16, 0x0000_0000_03FF_FFFF)  # magic
         struct.pack_into("<H", page, off + 24, num_entries)  # num_entries
         struct.pack_into("<H", page, off + 26, 0x1FFF)  # first_empty
