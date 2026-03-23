@@ -25,6 +25,8 @@ from datetime import datetime
 TOOLS_DIR = Path(__file__).parent
 SYNC_MASTER = TOOLS_DIR / "sync_master.py"
 SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
+# Device Library Plus key (exportLibrary.db on USB) — different from master.db key
+EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
 MASTER_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
 SYNC_CONFIG = TOOLS_DIR / "sync_config.json"
 
@@ -442,14 +444,14 @@ class SyncHandler(BaseHTTPRequestHandler):
                 return
             usb_path = drives[0]["path"]
 
-        # Try exportLibrary.db first (our tool's format)
+        # Try exportLibrary.db first (Device Library Plus or djmd format)
         db_path = Path(usb_path) / "PIONEER" / "rekordbox" / "exportLibrary.db"
         if db_path.exists():
             result = self._read_usb_sqlcipher(usb_path, db_path)
             if result is not None:
                 self.send_json(200, result)
                 return
-            # SQLCipher failed (likely encrypted) — fall through to PDB
+            # Both DLP and djmd formats failed — fall through to PDB
 
         # Fallback: read export.pdb via Node.js
         result = self._read_usb_pdb(usb_path)
@@ -463,13 +465,106 @@ class SyncHandler(BaseHTTPRequestHandler):
         })
 
     def _read_usb_sqlcipher(self, usb_path, db_path):
-        """Try reading USB data from exportLibrary.db. Returns dict or None."""
+        """Try reading USB data from exportLibrary.db. Returns dict or None.
+        Tries Device Library Plus format first (export key, SQLCipher 4 defaults),
+        then falls back to djmd format (master key, legacy=4)."""
         try:
             import sqlcipher3
         except ImportError:
             return None
 
+        # Try Device Library Plus format first (Rekordbox-created USBs)
+        result = self._read_usb_dlp(usb_path, db_path)
+        if result:
+            return result
+
+        # Fall back to djmd format (our tool's legacy format)
+        return self._read_usb_djmd(usb_path, db_path)
+
+    def _read_usb_dlp(self, usb_path, db_path):
+        """Read USB data from Device Library Plus format exportLibrary.db."""
         try:
+            import sqlcipher3
+            con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
+            con.execute(f"PRAGMA key='{EXPORT_KEY}'")
+            # No legacy mode — SQLCipher 4 defaults
+            con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+
+            # Check if this is DLP schema (has 'content' table, not 'djmdContent')
+            tables = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            if 'content' not in tables:
+                con.close()
+                return None
+
+            def build_tree(parent_id):
+                rows = con.execute(
+                    "SELECT playlist_id, name, attribute FROM playlist "
+                    "WHERE playlist_id_parent=? ORDER BY sequenceNo, name",
+                    (parent_id,)
+                ).fetchall()
+                nodes = []
+                for row_id, name, attr in rows:
+                    if attr == 1:  # folder
+                        children = build_tree(row_id)
+                        total = sum(
+                            n["track_count"] if n["type"] == "playlist"
+                            else n.get("total_tracks", 0) for n in children
+                        )
+                        nodes.append({
+                            "id": str(row_id), "name": name, "type": "folder",
+                            "children": children, "total_tracks": total
+                        })
+                    else:  # playlist
+                        count = con.execute(
+                            "SELECT COUNT(*) FROM playlist_content WHERE playlist_id=?",
+                            (row_id,)
+                        ).fetchone()[0]
+                        tracks = con.execute("""
+                            SELECT c.title, a.name as artist, c.bpmx100, c.length
+                            FROM playlist_content pc
+                            JOIN content c ON pc.content_id = c.content_id
+                            LEFT JOIN artist a ON c.artist_id_artist = a.artist_id
+                            WHERE pc.playlist_id=?
+                            ORDER BY pc.sequenceNo
+                        """, (row_id,)).fetchall()
+                        track_list = [{
+                            "title": t[0] or "Unknown",
+                            "artist": t[1] or "Unknown",
+                            "bpm": round(t[2] / 100, 1) if t[2] else None,
+                            "duration": t[3] or 0
+                        } for t in tracks]
+                        nodes.append({
+                            "id": str(row_id), "name": name, "type": "playlist",
+                            "track_count": count, "tracks": track_list
+                        })
+                return nodes
+
+            tree = build_tree(0)
+            total_tracks = con.execute("SELECT COUNT(*) FROM content").fetchone()[0]
+            total_artists = con.execute("SELECT COUNT(*) FROM artist").fetchone()[0]
+            total_playlists = con.execute(
+                "SELECT COUNT(*) FROM playlist WHERE attribute=0"
+            ).fetchone()[0]
+            con.close()
+
+            return {
+                "usb_name": Path(usb_path).name,
+                "usb_path": usb_path,
+                "source": "exportLibrary.db (Device Library Plus)",
+                "total_tracks": total_tracks,
+                "total_artists": total_artists,
+                "total_playlists": total_playlists,
+                "tree": tree
+            }
+        except Exception:
+            return None
+
+    def _read_usb_djmd(self, usb_path, db_path):
+        """Read USB data from djmd-format exportLibrary.db (legacy)."""
+        try:
+            import sqlcipher3
             con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
             con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
             con.execute("PRAGMA cipher='sqlcipher'")

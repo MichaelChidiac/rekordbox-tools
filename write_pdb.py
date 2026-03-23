@@ -23,6 +23,8 @@ import sqlcipher3
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
+# Device Library Plus key (exportLibrary.db on USB) — different from master.db key
+EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
 
 PAGE_SIZE = 4096
 HEADER_SIZE = 40  # bytes at start of every page
@@ -176,16 +178,22 @@ def serialize_track_row(t: dict) -> bytes:
     `t` is a dict with all required track fields.
     """
     # ── Fixed fields (94 bytes before string offsets) ──────────────────────
+    # Compute bitmask: base 0x000C0700 (bits 8,9,10,18,19 always set),
+    # add bit 16 if comment is non-empty (matches Rekordbox reference pattern)
+    bitmask = 0x000C0700
+    if t.get("comment", ""):
+        bitmask |= 0x10000  # bit 16 = comment present
+
     fixed = bytearray()
     fixed.extend(struct.pack("<H", 0x0024))   # _unnamed0 (subtype)
     fixed.extend(struct.pack("<H", t.get("indexShift", 0)))
-    fixed.extend(struct.pack("<I", t.get("bitmask", 0)))
+    fixed.extend(struct.pack("<I", bitmask))
     fixed.extend(struct.pack("<I", t.get("sampleRate", 44100)))
     fixed.extend(struct.pack("<I", t.get("composerId", 0)))
     fixed.extend(struct.pack("<I", t.get("fileSize", 0)))
-    fixed.extend(struct.pack("<I", 0))        # _unnamed6
-    fixed.extend(struct.pack("<H", 0))        # _unnamed7
-    fixed.extend(struct.pack("<H", 0))        # _unnamed8
+    fixed.extend(struct.pack("<I", t.get("_unnamed6", 0)))
+    fixed.extend(struct.pack("<H", t.get("_unnamed7", 47387)))  # constant from reference
+    fixed.extend(struct.pack("<H", t.get("_unnamed8", 55941)))  # constant from reference
     fixed.extend(struct.pack("<I", t.get("artworkId", 0)))
     fixed.extend(struct.pack("<I", t.get("keyId", 0)))
     fixed.extend(struct.pack("<I", t.get("originalArtistId", 0)))
@@ -408,9 +416,7 @@ class PdbWriter:
                 unk10=1, flags=0x64,
                 is_index=True, index_unk1=0x1FFF1FFF, index_unk2=1004,
             )
-            # Minimal sentinel page (type & index only)
-            struct.pack_into("<I", empty_page, 0x04, empty_idx)
-            struct.pack_into("<I", empty_page, 0x08, table_type)
+            # Leave empty_page as all zeros (matches reference format)
 
             self.table_info.append({
                 "type": table_type,
@@ -461,18 +467,12 @@ class PdbWriter:
         Returns the complete PDB file as bytes.
         """
         # Allocate sentinel (empty) pages for each populated table's empty_candidate
+        # Reference PDBs have ALL-ZERO empty candidate pages
         for info in self.table_info:
             if info["empty_candidate"] == -1:
                 sentinel_idx, sentinel_page = self._alloc_page()
                 info["empty_candidate"] = sentinel_idx
-
-                # Write a minimal empty data page header for the sentinel
-                table_type = info["type"]
-                self._write_page_header(
-                    sentinel_page, sentinel_idx, table_type, sentinel_idx,
-                    flags=0x24,
-                    dph_unk5=0, dph_unk_nrl=0x1FFF,
-                )
+                # Leave sentinel_page as all zeros (matches reference format)
 
                 # Set last data page's next_page to sentinel
                 dp_indices = info.get("_data_page_indices", [])
@@ -489,7 +489,7 @@ class PdbWriter:
         struct.pack_into("<I", page0, 0x08, num_tables)     # num tables
         struct.pack_into("<I", page0, 0x0C, next_unused)    # next unused page
         struct.pack_into("<I", page0, 0x10, 5)              # unknown (always 5)
-        struct.pack_into("<I", page0, 0x14, 0)              # sequence
+        struct.pack_into("<I", page0, 0x14, 1)              # sequence (non-zero)
         struct.pack_into("<I", page0, 0x18, 0)              # gap
 
         # Table pointers: 20 × 16 bytes
@@ -509,7 +509,18 @@ class PdbWriter:
 # ── Database Reading ──────────────────────────────────────────────────────────
 
 def open_export_db(db_path: Path):
-    """Open the SQLCipher-encrypted exportLibrary.db (read-only)."""
+    """Open the SQLCipher-encrypted exportLibrary.db (read-only).
+    Tries Device Library Plus key first, falls back to master.db key."""
+    # Try Device Library Plus format (export key, SQLCipher 4 defaults)
+    try:
+        con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
+        con.execute(f"PRAGMA key='{EXPORT_KEY}'")
+        con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+        return con
+    except Exception:
+        pass
+
+    # Fall back to djmd format (master key, legacy=4)
     con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
     con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
     con.execute("PRAGMA cipher='sqlcipher'")
@@ -559,9 +570,218 @@ def fix_analyze_path(path: str) -> str:
 
 
 def read_export_db(db_path: Path) -> dict:
-    """Read all tables from exportLibrary.db, return structured data."""
+    """Read all tables from exportLibrary.db, return structured data.
+    Handles both Device Library Plus (DLP) and djmd formats automatically."""
     con = open_export_db(db_path)
 
+    # Detect schema format
+    tables = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    is_dlp = 'content' in tables and 'djmdContent' not in tables
+
+    if is_dlp:
+        return _read_dlp_db(con)
+    else:
+        return _read_djmd_db(con)
+
+
+def _read_dlp_db(con) -> dict:
+    """Read Device Library Plus format database."""
+    data = {}
+
+    # Colors
+    colors = []
+    for row in con.execute("SELECT color_id, name FROM color ORDER BY color_id"):
+        cid = safe_int(row[0])
+        name = row[1] or COLOR_NAMES.get(cid, "")
+        colors.append({"id": cid, "code": cid, "name": name})
+    data["colors"] = colors
+
+    # Genres
+    genres = []
+    for row in con.execute("SELECT genre_id, name FROM genre ORDER BY genre_id"):
+        genres.append({"id": safe_int(row[0]), "name": row[1] or ""})
+    data["genres"] = genres
+
+    # Artists
+    artists = []
+    for row in con.execute("SELECT artist_id, name FROM artist ORDER BY artist_id"):
+        artists.append({"id": safe_int(row[0]), "name": row[1] or ""})
+    data["artists"] = artists
+
+    # Albums
+    albums = []
+    for row in con.execute("SELECT album_id, name, artist_id FROM album ORDER BY album_id"):
+        albums.append({
+            "id": safe_int(row[0]),
+            "name": row[1] or "",
+            "artistId": safe_int(row[2]),
+        })
+    data["albums"] = albums
+
+    # Labels
+    labels = []
+    for row in con.execute("SELECT label_id, name FROM label ORDER BY label_id"):
+        labels.append({"id": safe_int(row[0]), "name": row[1] or ""})
+    data["labels"] = labels
+
+    # Keys
+    keys = []
+    for row in con.execute("SELECT key_id, name FROM key ORDER BY key_id"):
+        keys.append({"id": safe_int(row[0]), "name": row[1] or ""})
+    data["keys"] = keys
+
+    # Artwork (images)
+    artwork = []
+    try:
+        for row in con.execute("SELECT image_id, path FROM image WHERE path IS NOT NULL AND path != '' ORDER BY image_id"):
+            artwork.append({"id": safe_int(row[0]), "path": row[1] or ""})
+    except Exception:
+        pass
+    data["artwork"] = artwork
+
+    # Playlists
+    playlists = []
+    for row in con.execute("SELECT playlist_id, name, playlist_id_parent, sequenceNo, attribute "
+                           "FROM playlist ORDER BY playlist_id_parent, sequenceNo"):
+        parent_id = safe_int(row[2])
+        playlists.append({
+            "id": safe_int(row[0]),
+            "name": row[1] or "",
+            "parentId": parent_id,
+            "sortOrder": safe_int(row[3]),
+            "rawIsFolder": 1 if safe_int(row[4]) == 1 else 0,
+        })
+    data["playlists"] = playlists
+
+    # Build valid content ID set
+    content_ids = set()
+    for row in con.execute("SELECT content_id FROM content"):
+        content_ids.add(str(row[0]))
+
+    # Playlist entries
+    playlist_entries = []
+    for row in con.execute("SELECT playlist_id, content_id, sequenceNo FROM playlist_content ORDER BY playlist_id, sequenceNo"):
+        content_str = str(row[1])
+        if content_str not in content_ids:
+            continue
+        playlist_entries.append({
+            "playlistId": safe_int(row[0]),
+            "trackId": safe_int(row[1]),
+            "entryIndex": safe_int(row[2]),
+        })
+    data["playlist_entries"] = playlist_entries
+
+    # Tracks
+    tracks = []
+    for row in con.execute(
+        "SELECT content_id, title, artist_id_artist, album_id, genre_id, color_id, key_id, "
+        "label_id, path, fileName, bpmx100, length, bitrate, samplingRate, "
+        "releaseYear, rating, trackNo, discNo, fileSize, dateAdded, "
+        "analysisDataFilePath, djComment, dateCreated, releaseDate, "
+        "isHotCueAutoLoadOn, isrc, artist_id_lyricist, artist_id_remixer, "
+        "artist_id_originalArtist, artist_id_composer, bitDepth, masterContentId "
+        "FROM content ORDER BY content_id"
+    ):
+        track_id = safe_int(row[0])
+        folder_path = row[8] or ""
+        filename = row[9] or ""
+        bpm_raw = safe_int(row[10])
+        length_sec = safe_int(row[11])
+        bitrate = safe_int(row[12])
+        sample_rate = safe_int(row[13], 44100)
+        year = safe_int16(row[14])
+        rating = safe_int(row[15])
+        track_no = safe_int(row[16])
+        disc_no = safe_int16(row[17])
+        file_size = safe_int(row[18])
+        stock_date = row[19] or ""
+        analysis_path = row[20] or ""
+        comment = row[21] or ""
+        date_created = row[22] or ""
+        release_date = row[23] or ""
+        hotcue_autoload = "ON" if row[24] else "OFF"
+        isrc = row[25] or ""
+        lyricist_id = safe_int(row[26])
+        remixer_id = safe_int(row[27])
+        org_artist_id = safe_int(row[28])
+        composer_id = safe_int(row[29])
+        bit_depth = safe_int(row[30], 16)
+        master_content_id = safe_int(row[31])
+
+        date_added = ""
+        if date_created:
+            date_added = date_created[:10]
+        if not date_added and stock_date:
+            date_added = stock_date[:10]
+
+        analyze_path = fix_analyze_path(analysis_path)
+        analyze_date = date_added
+
+        color_id = safe_int(row[5])
+        file_type = 1
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        FILE_TYPE_MAP = {"mp3": 1, "m4a": 4, "aac": 4, "flac": 5,
+                         "wav": 11, "aiff": 12, "aif": 12}
+        file_type = FILE_TYPE_MAP.get(ext, 1)
+
+        tracks.append({
+            "id": track_id,
+            "title": row[1] or "",
+            "artistId": safe_int(row[2]),
+            "albumId": safe_int(row[3]),
+            "genreId": safe_int(row[4]),
+            "colorId": color_id,
+            "keyId": safe_int(row[6]),
+            "labelId": safe_int(row[7]),
+            "remixerId": remixer_id,
+            "originalArtistId": org_artist_id,
+            "composerId": composer_id,
+            "sampleRate": sample_rate,
+            "fileSize": file_size,
+            "_unnamed6": master_content_id,
+            "artworkId": 0,
+            "bitrate": bitrate,
+            "trackNumber": track_no,
+            "tempo": bpm_raw,
+            "discNumber": disc_no,
+            "playCount": 0,
+            "year": year,
+            "sampleDepth": bit_depth if bit_depth else 16,
+            "duration": length_sec & 0xFFFF,
+            "rating": rating & 0xFF,
+            "fileType": file_type,
+            "isrc": isrc,
+            "texter": "",
+            "unknownString2": "10",
+            "unknownString3": "10",
+            "unknownString4": "8",
+            "message": "",
+            "kuvoPublic": "",
+            "autoloadHotcues": hotcue_autoload,
+            "unknownString5": "",
+            "unknownString6": "",
+            "dateAdded": date_added,
+            "releaseDate": release_date[:10] if release_date else "",
+            "mixName": "",
+            "unknownString7": "",
+            "analyzePath": analyze_path,
+            "analyzeDate": analyze_date,
+            "comment": comment,
+            "title": row[1] or "",
+            "unknownString8": "",
+            "filename": filename,
+            "filePath": folder_path,
+        })
+    data["tracks"] = tracks
+
+    con.close()
+    return data
+
+
+def _read_djmd_db(con) -> dict:
+    """Read djmd-format database (legacy format)."""
     data = {}
 
     # ── Colors ────────────────────────────────────────────────────────────
@@ -669,7 +889,7 @@ def read_export_db(db_path: Path) -> dict:
         "ReleaseYear, Rating, TrackNo, DiscNo, FileSize, StockDate, "
         "AnalysisDataPath, Commnt, DateCreated, ReleaseDate, "
         "HotCueAutoLoad, ISRC, Lyricist, RemixerID, OrgArtistID, "
-        "ComposerID, BitDepth "
+        "ComposerID, BitDepth, rb_local_usn "
         "FROM djmdContent WHERE rb_local_deleted=0 "
         "ORDER BY CAST(ID AS INTEGER)"
     ):
@@ -697,6 +917,7 @@ def read_export_db(db_path: Path) -> dict:
         org_artist_id = safe_int(row[28])
         composer_id = safe_int(row[29])
         bit_depth = safe_int(row[30], 16)
+        rb_local_usn = safe_int(row[31])
 
         # Parse dateAdded from DateCreated (format: "2026-03-22 21:39:25.168 +00:00")
         date_added = ""
@@ -734,6 +955,7 @@ def read_export_db(db_path: Path) -> dict:
             "composerId": composer_id,
             "sampleRate": sample_rate,
             "fileSize": file_size,
+            "_unnamed6": rb_local_usn,
             "artworkId": 0,  # no artwork table data
             "bitrate": bitrate,
             "trackNumber": track_no,
@@ -748,9 +970,9 @@ def read_export_db(db_path: Path) -> dict:
             # String fields
             "isrc": isrc,
             "texter": lyricist,
-            "unknownString2": "",
-            "unknownString3": "",
-            "unknownString4": "",
+            "unknownString2": "10",
+            "unknownString3": "10",
+            "unknownString4": "8",
             "message": "",
             "kuvoPublic": "",
             "autoloadHotcues": hotcue_autoload if hotcue_autoload else "ON",
@@ -774,10 +996,83 @@ def read_export_db(db_path: Path) -> dict:
     return data
 
 
+def remap_ids(data: dict) -> dict:
+    """Remap all entity IDs to small sequential integers (1-based).
+
+    Rekordbox USB exports use small sequential IDs. Our master.db IDs can be
+    very large (>2^31), which Rekordbox treats as negative when read as signed
+    int32, causing it to discard all track/playlist data. Colors (IDs 1-8) are
+    kept as-is since they already use small IDs.
+    """
+    # Build old→new mappings for each entity type
+    def make_map(items, start=1):
+        m = {}
+        for i, item in enumerate(items, start):
+            old_id = item["id"]
+            m[old_id] = i
+            item["id"] = i
+        return m
+
+    genre_map = make_map(data["genres"])
+    artist_map = make_map(data["artists"])
+    album_map = make_map(data["albums"])
+    label_map = make_map(data["labels"])
+    key_map = make_map(data["keys"])
+    # Colors keep their original IDs (already 1-8)
+    color_map = {c["id"]: c["id"] for c in data["colors"]}
+    artwork_map = make_map(data["artwork"])
+
+    # Remap album artist references
+    for a in data["albums"]:
+        a["artistId"] = artist_map.get(a.get("artistId", 0), 0)
+
+    # Remap track references
+    track_map = {}
+    for i, t in enumerate(data["tracks"], 1):
+        old_id = t["id"]
+        track_map[old_id] = i
+        t["id"] = i
+        t["artistId"] = artist_map.get(t.get("artistId", 0), 0)
+        t["albumId"] = album_map.get(t.get("albumId", 0), 0)
+        t["genreId"] = genre_map.get(t.get("genreId", 0), 0)
+        t["colorId"] = color_map.get(t.get("colorId", 0), 0)
+        t["keyId"] = key_map.get(t.get("keyId", 0), 0)
+        t["labelId"] = label_map.get(t.get("labelId", 0), 0)
+        t["remixerId"] = artist_map.get(t.get("remixerId", 0), 0)
+        t["originalArtistId"] = artist_map.get(t.get("originalArtistId", 0), 0)
+        t["composerId"] = artist_map.get(t.get("composerId", 0), 0)
+        t["artworkId"] = artwork_map.get(t.get("artworkId", 0), 0)
+
+    # Remap playlist IDs and parent references
+    playlist_map = {}
+    for i, p in enumerate(data["playlists"], 1):
+        old_id = p["id"]
+        playlist_map[old_id] = i
+        p["id"] = i
+    for p in data["playlists"]:
+        p["parentId"] = playlist_map.get(p.get("parentId", 0), 0)
+
+    # Remap playlist entry references
+    for e in data["playlist_entries"]:
+        e["trackId"] = track_map.get(e.get("trackId", 0), 0)
+        e["playlistId"] = playlist_map.get(e.get("playlistId", 0), 0)
+
+    # Remove entries with unmapped references
+    data["playlist_entries"] = [
+        e for e in data["playlist_entries"]
+        if e["trackId"] > 0 and e["playlistId"] > 0
+    ]
+
+    return data
+
+
 # ── PDB Generation ────────────────────────────────────────────────────────────
 
 def build_pdb(data: dict) -> bytes:
     """Build a complete export.pdb from the data dict."""
+    # Remap IDs to small sequential integers (required for Rekordbox)
+    data = remap_ids(data)
+
     writer = PdbWriter()
 
     # Page 0: file header (placeholder, finalized at end)
@@ -904,6 +1199,22 @@ def main():
     # ── Read data ─────────────────────────────────────────────────────────
     print(f"📖 Reading: {db_path}")
     data = read_export_db(db_path)
+
+    # ── Fill in missing file sizes from actual USB files ──────────────────
+    fixed_sizes = 0
+    for t in data["tracks"]:
+        if not t.get("fileSize"):
+            fp = t.get("filePath", "")
+            if fp:
+                full = usb_path / fp.lstrip("/")
+                if full.exists():
+                    t["fileSize"] = full.stat().st_size
+                    fixed_sizes += 1
+        # Set _unnamed6 to track ID as export reference value if not populated
+        if not t.get("_unnamed6") or t["_unnamed6"] <= 1:
+            t["_unnamed6"] = t.get("id", 1)
+    if fixed_sizes:
+        print(f"  📏 Filled {fixed_sizes} file sizes from USB filesystem")
 
     # Print summary
     print(f"  Tracks:           {len(data['tracks']):,}")

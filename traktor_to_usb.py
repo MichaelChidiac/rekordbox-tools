@@ -90,6 +90,8 @@ def force_checkpoint():
 # ── Config ─────────────────────────────────────────────────────────────────────
 MASTER_DB  = Path.home() / "Library/Pioneer/rekordbox/master.db"
 KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
+# Device Library Plus key (exportLibrary.db on USB) — different from master.db key
+EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
 PIONEER_DIR = "PIONEER"
 AUDIO_DIR   = "Contents"
 
@@ -122,6 +124,15 @@ def open_db(path, key=KEY):
     con.execute(f"PRAGMA key='{key}'")
     con.execute("PRAGMA cipher='sqlcipher'")
     con.execute("PRAGMA legacy=4")
+    con.execute("PRAGMA foreign_keys=OFF")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+def open_export_db(path, key=EXPORT_KEY):
+    """Open a Device Library Plus database (exportLibrary.db on USB).
+    Uses SQLCipher 4 defaults (no legacy mode) and the export key."""
+    con = sqlite3.connect(str(path), timeout=30)
+    con.execute(f"PRAGMA key='{key}'")
     con.execute("PRAGMA foreign_keys=OFF")
     con.execute("PRAGMA busy_timeout=30000")
     return con
@@ -981,6 +992,299 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     print(f"     exportLibrary.db : {usb_db_path}")
     print(f"     masterPlaylists6.xml : {xml_manifest}")
 
+
+# ── Device Library Plus conversion ─────────────────────────────────────────────
+
+DEVICE_LIB_PLUS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS album(album_id integer primary key, name varchar, artist_id integer, image_id integer, isComplation integer, nameForSearch varchar);
+CREATE TABLE IF NOT EXISTS artist(artist_id integer primary key, name varchar, nameForSearch varchar);
+CREATE TABLE IF NOT EXISTS category(category_id integer primary key, menuItem_id integer, sequenceNo integer, isVisible integer);
+CREATE TABLE IF NOT EXISTS color(color_id integer primary key, name varchar);
+CREATE TABLE IF NOT EXISTS content(content_id integer primary key, title varchar, titleForSearch varchar, subtitle varchar, bpmx100 integer, length integer, trackNo integer, discNo integer, artist_id_artist integer, artist_id_remixer integer, artist_id_originalArtist integer, artist_id_composer integer, artist_id_lyricist integer, album_id integer, genre_id integer, label_id integer, key_id integer, color_id integer, image_id integer, djComment varchar, rating integer, releaseYear integer, releaseDate varchar, dateCreated varchar, dateAdded varchar, path varchar, fileName varchar, fileSize integer, fileType integer, bitrate integer, bitDepth integer, samplingRate integer, isrc varchar, djPlayCount integer, isHotCueAutoLoadOn integer, isKuvoDeliverStatusOn integer, kuvoDeliveryComment varchar, masterDbId integer, masterContentId integer, analysisDataFilePath varchar, analysedBits integer, contentLink integer, hasModified integer, cueUpdateCount integer, analysisDataUpdateCount integer, informationUpdateCount integer);
+CREATE TABLE IF NOT EXISTS cue(cue_id integer primary key, content_id integer, kind integer, colorTableIndex integer, cueComment varchar, isActiveLoop integer, beatLoopNumerator integer, beatLoopDenominator integer, inUsec integer, outUsec integer, in150FramePerSec integer, out150FramePerSec integer, inMpegFrameNumber integer, outMpegFrameNumber integer, inMpegAbs integer, outMpegAbs integer, inDecodingStartFramePosition integer, outDecodingStartFramePosition integer, inFileOffsetInBlock integer, OutFileOffsetInBlock integer, inNumberOfSampleInBlock integer, outNumberOfSampleInBlock integer);
+CREATE TABLE IF NOT EXISTS genre(genre_id integer primary key, name varchar);
+CREATE TABLE IF NOT EXISTS history(history_id integer primary key, sequenceNo integer, name varchar, attribute integer, history_id_parent integer);
+CREATE TABLE IF NOT EXISTS history_content(history_id integer, content_id integer, sequenceNo integer);
+CREATE TABLE IF NOT EXISTS hotCueBankList(hotCueBankList_id integer primary key, sequenceNo integer, name varchar, image_id integer, attribute integer, hotCueBankList_id_parent integer);
+CREATE TABLE IF NOT EXISTS hotCueBankList_cue(hotCueBankList_id integer, cue_id integer, sequenceNo integer);
+CREATE TABLE IF NOT EXISTS image(image_id integer primary key, path varchar);
+CREATE TABLE IF NOT EXISTS key(key_id integer primary key, name varchar);
+CREATE TABLE IF NOT EXISTS label(label_id integer primary key, name varchar);
+CREATE TABLE IF NOT EXISTS menuItem(menuItem_id integer primary key, kind integer, name varchar);
+CREATE TABLE IF NOT EXISTS myTag(myTag_id integer primary key, sequenceNo integer, name varchar, attribute integer, myTag_id_parent integer);
+CREATE TABLE IF NOT EXISTS myTag_content(myTag_id integer, content_id integer);
+CREATE TABLE IF NOT EXISTS playlist(playlist_id integer primary key, sequenceNo integer, name varchar, image_id integer, attribute integer, playlist_id_parent integer);
+CREATE TABLE IF NOT EXISTS playlist_content(playlist_id integer, content_id integer, sequenceNo integer);
+CREATE TABLE IF NOT EXISTS property(deviceName varchar, dbVersion varchar, numberOfContents integer, createdDate varchar, backGroundColorType integer, myTagMasterDBID integer);
+CREATE TABLE IF NOT EXISTS recommendedLike(content_id_1 integer, content_id_2 integer, rating integer, createdDate integer);
+CREATE TABLE IF NOT EXISTS sort(sort_id integer primary key, menuItem_id integer, sequenceNo integer, isVisible integer, isSelectedAsSubColumn integer);
+CREATE INDEX IF NOT EXISTS index_hotCueBankList_cue_hotCueBankList_id on hotCueBankList_cue(hotCueBankList_id);
+CREATE INDEX IF NOT EXISTS index_myTag_content_content_id on myTag_content(content_id);
+CREATE INDEX IF NOT EXISTS index_myTag_content_myTag_id on myTag_content(myTag_id);
+CREATE INDEX IF NOT EXISTS index_playlist_content_playlist_id on playlist_content(playlist_id);
+"""
+
+def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_run: bool = False):
+    """Convert a djmd-format exportLibrary.db to Device Library Plus format.
+
+    Reads the current exportLibrary.db (master.db schema, master key),
+    writes a new one with Device Library Plus schema and export key.
+    """
+    if not djmd_db_path.exists():
+        print("  ⚠️  No exportLibrary.db to convert")
+        return False
+
+    # Open source DB (djmd format, master key, legacy=4)
+    src = open_db(djmd_db_path)
+
+    # Collect data from djmd tables
+    content_rows = src.execute("""
+        SELECT ID, Title, SearchStr, Subtitle, BPM, Length, TrackNo, DiscNo,
+               ArtistID, RemixerID, OrgArtistID, ComposerID, Lyricist,
+               AlbumID, GenreID, LabelID, KeyID, ColorID, ImagePath,
+               Commnt, Rating, ReleaseYear, ReleaseDate, DateCreated, StockDate,
+               FolderPath, FileNameL, FileSize, FileType, BitRate, BitDepth,
+               SampleRate, ISRC, DJPlayCount, HotCueAutoLoad, DeliveryControl,
+               DeliveryComment, MasterDBID, MasterSongID, AnalysisDataPath,
+               Analysed, ContentLink, ModifiedByRBM, CueUpdated, AnalysisUpdated,
+               TrackInfoUpdated
+        FROM djmdContent WHERE rb_local_deleted=0
+    """).fetchall()
+
+    artist_rows = src.execute(
+        "SELECT ID, Name, SearchStr FROM djmdArtist WHERE rb_local_deleted=0"
+    ).fetchall()
+
+    album_rows = src.execute(
+        "SELECT ID, Name, ArtistID, ImagePath, Compilation, SearchStr FROM djmdAlbum WHERE rb_local_deleted=0"
+    ).fetchall()
+
+    genre_rows = src.execute("SELECT ID, Name FROM djmdGenre WHERE rb_local_deleted=0").fetchall()
+    label_rows = src.execute("SELECT ID, Name FROM djmdLabel WHERE rb_local_deleted=0").fetchall()
+    key_rows = src.execute("SELECT ID, ScaleName FROM djmdKey WHERE rb_local_deleted=0").fetchall()
+    color_rows = src.execute("SELECT ID, Commnt FROM djmdColor WHERE rb_local_deleted=0").fetchall()
+
+    playlist_rows = src.execute(
+        "SELECT ID, Seq, Name, ImagePath, Attribute, ParentID FROM djmdPlaylist WHERE rb_local_deleted=0"
+    ).fetchall()
+
+    song_playlist_rows = src.execute(
+        "SELECT PlaylistID, ContentID, TrackNo FROM djmdSongPlaylist WHERE rb_local_deleted=0"
+    ).fetchall()
+
+    src.close()
+
+    n_tracks = len(content_rows)
+    n_playlists = len(playlist_rows)
+    n_entries = len(song_playlist_rows)
+
+    if dry_run:
+        print(f"  Would create Device Library Plus DB: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries")
+        return True
+
+    # Build ID maps (djmd uses string IDs, Device Library Plus uses integer IDs)
+    # Map string IDs to sequential integers starting from 1
+    def build_id_map(rows, id_col=0):
+        """Map string IDs to sequential integers."""
+        id_map = {}
+        for i, row in enumerate(rows, 1):
+            id_map[str(row[id_col])] = i
+        return id_map
+
+    content_id_map = build_id_map(content_rows)
+    artist_id_map = build_id_map(artist_rows)
+    album_id_map = build_id_map(album_rows)
+    genre_id_map = build_id_map(genre_rows)
+    label_id_map = build_id_map(label_rows)
+    key_id_map = build_id_map(key_rows)
+    color_id_map = build_id_map(color_rows)
+    playlist_id_map = {}
+
+    def map_id(val, id_map):
+        """Map a string ID to its integer equivalent, or None."""
+        if val is None or str(val) == '' or str(val) == 'None':
+            return None
+        return id_map.get(str(val))
+
+    # Remove old file + WAL/SHM
+    for ext in ['', '-wal', '-shm']:
+        p = Path(str(output_path) + ext)
+        if p.exists():
+            p.unlink()
+
+    # Create new DB with export key (SQLCipher 4 defaults)
+    out = open_export_db(output_path)
+    out.executescript(DEVICE_LIB_PLUS_SCHEMA)
+
+    # Insert artists
+    for row in artist_rows:
+        new_id = artist_id_map[str(row[0])]
+        out.execute("INSERT INTO artist VALUES (?,?,?)",
+                    (new_id, row[1], row[2]))
+
+    # Insert albums
+    for row in album_rows:
+        new_id = album_id_map[str(row[0])]
+        out.execute("INSERT INTO album VALUES (?,?,?,?,?,?)",
+                    (new_id, row[1], map_id(row[2], artist_id_map), None,
+                     safe_int(row[4]) if row[4] else 0, row[5]))
+
+    # Insert genres
+    for row in genre_rows:
+        new_id = genre_id_map[str(row[0])]
+        out.execute("INSERT INTO genre VALUES (?,?)", (new_id, row[1]))
+
+    # Insert labels
+    for row in label_rows:
+        new_id = label_id_map[str(row[0])]
+        out.execute("INSERT INTO label VALUES (?,?)", (new_id, row[1]))
+
+    # Insert keys
+    for row in key_rows:
+        new_id = key_id_map[str(row[0])]
+        out.execute("INSERT INTO key VALUES (?,?)", (new_id, row[1]))
+
+    # Insert colors
+    for row in color_rows:
+        new_id = color_id_map[str(row[0])]
+        out.execute("INSERT INTO color VALUES (?,?)", (new_id, row[1]))
+
+    # Insert images (from content image paths)
+    image_map = {}
+    image_id_seq = 1
+    for row in content_rows:
+        img_path = row[18]  # ImagePath
+        if img_path and img_path not in image_map:
+            image_map[img_path] = image_id_seq
+            out.execute("INSERT INTO image VALUES (?,?)", (image_id_seq, img_path))
+            image_id_seq += 1
+
+    # Insert content
+    for row in content_rows:
+        cid = content_id_map[str(row[0])]
+        out.execute("""INSERT INTO content VALUES (
+            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        )""", (
+            cid,
+            row[1],   # title
+            row[2],   # titleForSearch
+            row[3],   # subtitle
+            safe_int(row[4]),  # bpmx100
+            safe_int(row[5]),  # length
+            safe_int(row[6]),  # trackNo
+            safe_int(row[7]),  # discNo
+            map_id(row[8], artist_id_map),   # artist_id_artist
+            map_id(row[9], artist_id_map),   # artist_id_remixer
+            map_id(row[10], artist_id_map),  # artist_id_originalArtist
+            map_id(row[11], artist_id_map),  # artist_id_composer
+            map_id(row[12], artist_id_map),  # artist_id_lyricist
+            map_id(row[13], album_id_map),   # album_id
+            map_id(row[14], genre_id_map),   # genre_id
+            map_id(row[15], label_id_map),   # label_id
+            map_id(row[16], key_id_map),     # key_id
+            map_id(row[17], color_id_map),   # color_id
+            image_map.get(row[18]),           # image_id
+            row[19],  # djComment
+            safe_int(row[20]),  # rating
+            safe_int(row[21]),  # releaseYear
+            row[22],  # releaseDate
+            row[23],  # dateCreated
+            row[24],  # dateAdded
+            row[25],  # path (FolderPath)
+            row[26],  # fileName
+            safe_int(row[27]),  # fileSize
+            safe_int(row[28]),  # fileType
+            safe_int(row[29]),  # bitrate
+            safe_int(row[30]),  # bitDepth
+            safe_int(row[31]),  # samplingRate
+            row[32],  # isrc
+            safe_int(row[33]),  # djPlayCount
+            1 if row[34] else 0,  # isHotCueAutoLoadOn
+            1 if row[35] else 0,  # isKuvoDeliverStatusOn
+            row[36],  # kuvoDeliveryComment
+            row[37],  # masterDbId
+            row[38],  # masterContentId
+            row[39],  # analysisDataFilePath
+            safe_int(row[40]),  # analysedBits
+            safe_int(row[41]),  # contentLink
+            1 if row[42] else 0,  # hasModified
+            safe_int(row[43]),  # cueUpdateCount
+            safe_int(row[44]),  # analysisDataUpdateCount
+            safe_int(row[45]),  # informationUpdateCount
+        ))
+
+    # Insert playlists
+    for row in playlist_rows:
+        old_id = str(row[0])
+        parent_old = str(row[5]) if row[5] else "0"
+        # Generate sequential ID
+        if old_id not in playlist_id_map:
+            playlist_id_map[old_id] = len(playlist_id_map) + 1
+        new_id = playlist_id_map[old_id]
+        # Map parent (root='root' or '0' → 0)
+        if parent_old in ('root', '0', '', 'None'):
+            parent_new = 0
+        else:
+            if parent_old not in playlist_id_map:
+                playlist_id_map[parent_old] = len(playlist_id_map) + 1
+            parent_new = playlist_id_map[parent_old]
+
+        out.execute("INSERT INTO playlist VALUES (?,?,?,?,?,?)",
+                    (new_id, safe_int(row[1]), row[2], None,
+                     safe_int(row[4]), parent_new))
+
+    # Insert playlist_content
+    for row in song_playlist_rows:
+        pl_id = playlist_id_map.get(str(row[0]))
+        ct_id = content_id_map.get(str(row[1]))
+        if pl_id and ct_id:
+            out.execute("INSERT INTO playlist_content VALUES (?,?,?)",
+                        (pl_id, ct_id, safe_int(row[2])))
+
+    # Insert property
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    out.execute("INSERT INTO property VALUES (?,?,?,?,?,?)",
+                ('', '1000', n_tracks, today, 0, 0))
+
+    # Insert default sort/category/menuItem entries
+    menu_items = [
+        (1, 0, 'All'), (2, 1, 'Artist'), (3, 2, 'Album'), (4, 3, 'Track'),
+        (5, 4, 'BPM'), (6, 5, 'Genre'), (7, 6, 'Label'), (8, 7, 'Key'),
+        (9, 8, 'Bitrate'), (10, 9, 'DJ Play Count'), (11, 10, 'Rating'),
+        (12, 11, 'Color'), (13, 12, 'Original Artist'), (14, 13, 'Remixer'),
+        (15, 14, 'Date Added'), (16, 15, 'Lyricist'), (17, 16, 'Composer'),
+        (18, 17, 'Comment'), (19, 18, 'History'), (20, 19, 'My Tag'),
+        (21, 20, 'File Name'), (22, 21, 'Release Date'), (23, 22, 'Year'),
+        (24, 23, 'Playlist'), (25, 24, 'Search'), (26, 25, 'Folder'),
+        (27, 26, 'Hot Cue Bank'),
+    ]
+    for mid, kind, name in menu_items:
+        out.execute("INSERT OR IGNORE INTO menuItem VALUES (?,?,?)", (mid, kind, name))
+
+    # Default categories
+    for cid in range(1, 23):
+        out.execute("INSERT OR IGNORE INTO category VALUES (?,?,?,?)", (cid, cid, cid - 1, 1))
+
+    # Default sort entries
+    for sid in range(1, 18):
+        out.execute("INSERT OR IGNORE INTO sort VALUES (?,?,?,?,?)", (sid, sid, sid - 1, 1, 0))
+
+    out.commit()
+    out.close()
+
+    out_size = os.path.getsize(output_path)
+    print(f"  ✅ Device Library Plus: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries ({out_size:,} bytes)")
+    return True
+
+
+def safe_int(val, default=0):
+    if val is None or val == '' or val == 'None':
+        return default
+    try:
+        return int(val) & 0xFFFFFFFF
+    except (ValueError, TypeError):
+        return default
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
@@ -1119,6 +1423,30 @@ def main():
                     print(f"  ✅ Written {len(pdb_bytes):,} bytes ({len(pdb_bytes)//4096} pages)")
         except Exception as e:
             print(f"\n⚠️  export.pdb generation failed (USB still usable via exportLibrary.db): {e}")
+
+        # Convert exportLibrary.db from djmd format to Device Library Plus format
+        # (Rekordbox desktop reads the DLP format, not the djmd format)
+        db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
+        if db_path.exists():
+            print("\n🔄 Converting to Device Library Plus format ...")
+            dlp_path = db_path.parent / "exportLibrary_dlp.db"
+            try:
+                if convert_to_device_library_plus(db_path, dlp_path, args.dry_run):
+                    if not args.dry_run:
+                        # Replace old DB with new DLP DB
+                        for ext in ['', '-wal', '-shm']:
+                            old = Path(str(db_path) + ext)
+                            if old.exists():
+                                old.unlink()
+                        dlp_path.rename(db_path)
+                        print("  ✅ exportLibrary.db now in Device Library Plus format")
+            except Exception as e:
+                print(f"  ⚠️  DLP conversion failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Clean up partial output
+                if dlp_path.exists():
+                    dlp_path.unlink()
 
         print("\n✅ Export completed successfully")
 
