@@ -61,6 +61,52 @@ TABLE_NAMES = [
     "Unk15", "Columns", "Unk17", "Unk18", "History",
 ]
 
+# Standard column definitions for Pioneer CDJ browser (type 16)
+# (column_id, unknown0, name) — same for every Pioneer USB
+STANDARD_COLUMNS = [
+    (1, 128, "GENRE"), (2, 129, "ARTIST"), (3, 130, "ALBUM"), (4, 131, "TRACK"),
+    (5, 133, "BPM"), (6, 134, "RATING"), (7, 135, "YEAR"), (8, 136, "REMIXER"),
+    (9, 137, "LABEL"), (10, 138, "ORIGINAL ARTIST"), (11, 139, "KEY"),
+    (12, 141, "CUE"), (13, 142, "COLOR"), (14, 146, "TIME"), (15, 147, "BITRATE"),
+    (16, 148, "FILE NAME"), (17, 132, "PLAYLIST"), (18, 152, "HOT CUE BANK"),
+    (19, 149, "HISTORY"), (20, 145, "SEARCH"), (21, 150, "COMMENTS"),
+    (22, 140, "DATE ADDED"), (23, 151, "DJ PLAY COUNT"), (24, 144, "FOLDER"),
+    (25, 161, "DEFAULT"), (26, 162, "ALPHABET"), (27, 170, "MATCHING"),
+]
+
+# Standard menu entries for Pioneer CDJ browser (type 17)
+# (category_id, content_pointer/menuItem_id, unknown, visibility, sort_order)
+STANDARD_MENU = [
+    (1, 1, 99, 0, 0), (5, 6, 5, 0, 0), (6, 7, 99, 0, 0), (7, 8, 99, 0, 0),
+    (8, 9, 99, 0, 0), (9, 10, 99, 0, 0), (10, 11, 99, 0, 0),
+    (14, 19, 4, 0, 0), (15, 20, 6, 0, 0), (16, 21, 99, 0, 0), (18, 23, 99, 0, 0),
+    (2, 2, 2, 1, 1), (3, 3, 3, 1, 2), (4, 4, 1, 1, 3),
+    (11, 12, 99, 1, 4), (13, 15, 99, 1, 5), (17, 5, 99, 1, 6),
+    (19, 22, 99, 1, 7), (20, 18, 99, 1, 8), (27, 26, 99, 2, 9),
+    (24, 17, 99, 1, 10), (22, 27, 99, 1, 11),
+]
+
+# Standard sort/column-association entries (type 18) — raw 8-byte rows
+STANDARD_SORT_ROWS = [
+    bytes.fromhex("1500070001000000"),
+    bytes.fromhex("0e00080001000000"),
+    bytes.fromhex("0800090001000000"),
+    bytes.fromhex("09000a0001000000"),
+    bytes.fromhex("0a000b0001000000"),
+    bytes.fromhex("0f000d0001000000"),
+    bytes.fromhex("1700100001000000"),
+    bytes.fromhex("1600110001000000"),
+    bytes.fromhex("1900000000010000"),
+    bytes.fromhex("1a00010000020000"),
+    bytes.fromhex("0200020000030000"),
+    bytes.fromhex("0300030000040000"),
+    bytes.fromhex("0b000c0000050000"),
+    bytes.fromhex("0d000f0002060000"),
+    bytes.fromhex("0500040000070000"),
+    bytes.fromhex("0600050000080000"),
+    bytes.fromhex("0000000000000000"),
+]
+
 COLOR_NAMES = {
     1: "Pink", 2: "Red", 3: "Orange", 4: "Yellow",
     5: "Green", 6: "Aqua", 7: "Blue", 8: "Purple",
@@ -123,6 +169,19 @@ def serialize_label_row(label_id: int, name: str) -> bytes:
 def serialize_artwork_row(art_id: int, path: str) -> bytes:
     """Type 13: ArtworkRow — id(u4le) + path."""
     return struct.pack("<I", art_id) + encode_devicesql_string(path)
+
+
+def serialize_column_entry(col_id: int, unknown0: int, name: str) -> bytes:
+    """Type 16: ColumnEntry — id(u2le) + unknown0(u2le) + DeviceSQLString name."""
+    data = struct.pack("<HH", col_id, unknown0)
+    data += encode_devicesql_string(name)
+    return data
+
+
+def serialize_menu_row(category_id: int, content_pointer: int, unknown: int,
+                       visibility: int, sort_order: int) -> bytes:
+    """Type 17: Menu — categoryId(u4le) + contentPointer(u4le) + unknown(u4le) + visibility(u4le) + sortOrder(u4le)."""
+    return struct.pack("<5I", category_id, content_pointer, unknown, visibility, sort_order)
 
 
 def serialize_key_row(key_id: int, name: str) -> bytes:
@@ -1191,12 +1250,22 @@ def build_pdb(data: dict) -> bytes:
     art_rows = [serialize_artwork_row(a["id"], a["path"]) for a in data["artwork"]]
     writer.write_table(ARTWORK, art_rows)
 
-    # ── Types 14-19: Empty tables ────────────────────────────────────────
+    # ── Types 14-15: Empty tables ───────────────────────────────────────
     writer.write_table(UNK14, [])
     writer.write_table(UNK15, [])
-    writer.write_table(COLUMNS, [])
-    writer.write_table(UNK17, [])
-    writer.write_table(UNK18, [])
+
+    # ── Type 16: COLUMNS (system table) ──────────────────────────────────
+    col_rows = [serialize_column_entry(cid, unk, name) for cid, unk, name in STANDARD_COLUMNS]
+    writer.write_table(COLUMNS, col_rows)
+
+    # ── Type 17: MENU (system table) ─────────────────────────────────────
+    menu_rows = [serialize_menu_row(*m) for m in STANDARD_MENU]
+    writer.write_table(UNK17, menu_rows)
+
+    # ── Type 18: SORT (system table) ─────────────────────────────────────
+    writer.write_table(UNK18, STANDARD_SORT_ROWS)
+
+    # ── Type 19: HISTORY ─────────────────────────────────────────────────
     writer.write_table(HISTORY, [])
 
     return writer.finalize()
