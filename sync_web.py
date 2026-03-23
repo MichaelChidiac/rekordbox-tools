@@ -79,6 +79,11 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"connected": len(drives) > 0, "drives": drives,
                                   "path": drives[0]["path"] if drives else None})
         
+        elif parsed_path.path == '/api/usb-playlists':
+            params = parse_qs(parsed_path.query)
+            usb_path = params.get('usb', [None])[0]
+            self.get_usb_playlists(usb_path)
+        
         else:
             self.send_response(404)
             self.end_headers()
@@ -423,6 +428,105 @@ class SyncHandler(BaseHTTPRequestHandler):
             pass
         return drives
 
+    def get_usb_playlists(self, usb_path=None):
+        """Read playlists and tracks from a USB's exportLibrary.db."""
+        try:
+            import sqlcipher3
+        except ImportError:
+            self.send_json(500, {"error": "sqlcipher3 module not available"})
+            return
+
+        # Auto-detect USB if not specified
+        if not usb_path:
+            drives = self.detect_usb()
+            if not drives:
+                self.send_json(404, {"error": "No Pioneer USB drives found"})
+                return
+            usb_path = drives[0]["path"]
+
+        db_path = Path(usb_path) / "PIONEER" / "rekordbox" / "exportLibrary.db"
+        if not db_path.exists():
+            self.send_json(404, {"error": f"No exportLibrary.db found on {Path(usb_path).name}. "
+                                          "This USB may use the older export.pdb format only."})
+            return
+
+        try:
+            con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
+            con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
+            con.execute("PRAGMA cipher='sqlcipher'")
+            con.execute("PRAGMA legacy=4")
+            # Verify we can actually read the DB
+            con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+
+            # Build playlist tree
+            def build_tree(parent_id):
+                rows = con.execute(
+                    "SELECT ID, Name, Attribute FROM djmdPlaylist "
+                    "WHERE ParentID=? ORDER BY Seq, Name",
+                    (str(parent_id),)
+                ).fetchall()
+                nodes = []
+                for row_id, name, attr in rows:
+                    if attr == 1:  # folder
+                        children = build_tree(row_id)
+                        total = sum(
+                            n["track_count"] if n["type"] == "playlist"
+                            else n.get("total_tracks", 0) for n in children
+                        )
+                        nodes.append({
+                            "id": str(row_id), "name": name, "type": "folder",
+                            "children": children, "total_tracks": total
+                        })
+                    else:  # playlist
+                        count = con.execute(
+                            "SELECT COUNT(*) FROM djmdSongPlaylist WHERE PlaylistID=?",
+                            (str(row_id),)
+                        ).fetchone()[0]
+                        # Get track details
+                        tracks = con.execute("""
+                            SELECT c.Title, a.Name as Artist, c.BPM, c.Length
+                            FROM djmdSongPlaylist sp
+                            JOIN djmdContent c ON sp.ContentID = c.ID
+                            LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
+                            WHERE sp.PlaylistID=?
+                            ORDER BY sp.TrackNo
+                        """, (str(row_id),)).fetchall()
+                        track_list = [{
+                            "title": t[0] or "Unknown",
+                            "artist": t[1] or "Unknown",
+                            "bpm": round(t[2] / 100, 1) if t[2] else None,
+                            "duration": t[3] or 0
+                        } for t in tracks]
+                        nodes.append({
+                            "id": str(row_id), "name": name, "type": "playlist",
+                            "track_count": count, "tracks": track_list
+                        })
+                return nodes
+
+            tree = build_tree('root')
+            total_tracks = con.execute("SELECT COUNT(*) FROM djmdContent").fetchone()[0]
+            total_artists = con.execute("SELECT COUNT(*) FROM djmdArtist").fetchone()[0]
+            total_playlists = con.execute(
+                "SELECT COUNT(*) FROM djmdPlaylist WHERE Attribute=0"
+            ).fetchone()[0]
+            con.close()
+
+            self.send_json(200, {
+                "usb_name": Path(usb_path).name,
+                "usb_path": usb_path,
+                "total_tracks": total_tracks,
+                "total_artists": total_artists,
+                "total_playlists": total_playlists,
+                "tree": tree
+            })
+        except Exception as e:
+            err_msg = str(e)
+            if "file is not a database" in err_msg:
+                err_msg = (f"Cannot read {Path(usb_path).name}'s database — "
+                           "it may use different encryption (Rekordbox-created USB exports "
+                           "use a device-specific key). Only USBs created by our tool can be browsed.")
+            self.send_json(500, {"error": err_msg})
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -666,6 +770,7 @@ HTML_TEMPLATE = """
         
         <div class="tabs">
             <button class="tab-button active" onclick="switchTab('sync-tab', this)">💾 USB Sync</button>
+            <button class="tab-button" onclick="switchTab('usb-browser-tab', this)">📀 USB Browser</button>
             <button class="tab-button" onclick="switchTab('traktor-tab', this)">🎵 Traktor → Rekordbox</button>
             <button class="tab-button" onclick="switchTab('history-tab', this)">📜 Import History</button>
         </div>
@@ -829,6 +934,33 @@ HTML_TEMPLATE = """
                 <div class="status" id="history-status"></div>
             </div>
         </div>
+
+        <!-- USB BROWSER TAB -->
+        <div class="tab-content" id="usb-browser-tab">
+            <div class="panel">
+                <div id="usb-browser-status" class="usb-status usb-disconnected">
+                    📀 Checking USB drives...
+                </div>
+
+                <div id="usb-browser-selector" style="display:none; margin-bottom:20px;">
+                    <div class="section-title" style="margin-bottom:8px;">Select USB Drive</div>
+                    <select id="usb-browser-drive" style="width:100%; padding:8px 12px; background:#1a1a1a; color:#e8e8e8; border:1px solid #444; border-radius:6px; font-size:0.95em;">
+                    </select>
+                </div>
+
+                <div id="usb-browser-summary" style="display:none; margin-bottom:20px; padding:12px 16px; background:#0d1117; border:1px solid #333; border-radius:8px;">
+                    <span id="usb-summary-text" style="color:#888; font-size:0.9em;"></span>
+                </div>
+
+                <div id="usb-browser-tree" style="display:none; max-height:600px; overflow-y:auto; padding:8px; border:1px solid #333; border-radius:8px; background:#1a1a1a;">
+                    <div style="text-align:center; color:#888;">Loading...</div>
+                </div>
+
+                <div class="buttons" style="margin-top:15px;">
+                    <button class="btn-secondary" onclick="loadUsbBrowser()" id="usb-refresh-btn" style="display:none;">🔄 Refresh</button>
+                </div>
+            </div>
+        </div>
     </div>
     
     <script>
@@ -843,8 +975,10 @@ HTML_TEMPLATE = """
                 loadHistoryPlaylists();
             }
             if (tabId === 'traktor-tab') {
-                // auto-wire radios on first switch
                 initTraktorTab();
+            }
+            if (tabId === 'usb-browser-tab') {
+                loadUsbBrowser();
             }
         }
         
@@ -1744,6 +1878,187 @@ HTML_TEMPLATE = """
             document.getElementById('traktor-dry-run').checked = false;
             document.getElementById('traktor-status').className = 'status';
             document.getElementById('traktor-status').innerHTML = '';
+        }
+
+        // ── USB BROWSER TAB ─────────────────────────────────────────────
+        var usbBrowserLoaded = false;
+
+        function loadUsbBrowser() {
+            var statusEl = document.getElementById('usb-browser-status');
+            var selectorEl = document.getElementById('usb-browser-selector');
+            var summaryEl = document.getElementById('usb-browser-summary');
+            var treeEl = document.getElementById('usb-browser-tree');
+            var refreshBtn = document.getElementById('usb-refresh-btn');
+
+            statusEl.className = 'usb-status usb-disconnected';
+            statusEl.textContent = '📀 Checking USB drives...';
+
+            fetch('/api/usb-status')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data.connected) {
+                        statusEl.textContent = '📀 No Pioneer USB drives found';
+                        selectorEl.style.display = 'none';
+                        summaryEl.style.display = 'none';
+                        treeEl.style.display = 'none';
+                        refreshBtn.style.display = 'inline-block';
+                        return;
+                    }
+
+                    // Populate drive selector
+                    var sel = document.getElementById('usb-browser-drive');
+                    sel.innerHTML = '';
+                    data.drives.forEach(function(d) {
+                        var opt = document.createElement('option');
+                        opt.value = d.path;
+                        opt.textContent = d.name;
+                        sel.appendChild(opt);
+                    });
+                    selectorEl.style.display = data.drives.length > 1 ? 'block' : 'none';
+                    sel.onchange = function() { fetchUsbPlaylists(sel.value); };
+
+                    statusEl.className = 'usb-status usb-connected';
+                    statusEl.textContent = '📀 ' + data.drives.map(function(d) { return d.name; }).join(', ') + ' connected';
+                    refreshBtn.style.display = 'inline-block';
+                    fetchUsbPlaylists(data.drives[0].path);
+                });
+        }
+
+        function fetchUsbPlaylists(usbPath) {
+            var treeEl = document.getElementById('usb-browser-tree');
+            var summaryEl = document.getElementById('usb-browser-summary');
+
+            treeEl.style.display = 'block';
+            treeEl.innerHTML = '<div style="text-align:center; color:#888; padding:20px;">Loading playlists...</div>';
+            summaryEl.style.display = 'none';
+
+            fetch('/api/usb-playlists?usb=' + encodeURIComponent(usbPath))
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.error) {
+                        treeEl.innerHTML = '<div style="color:#ff6b6b; padding:10px;">❌ ' + escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+
+                    // Summary
+                    summaryEl.style.display = 'block';
+                    document.getElementById('usb-summary-text').innerHTML =
+                        '🎵 <strong>' + data.total_tracks + '</strong> tracks · ' +
+                        '👤 <strong>' + data.total_artists + '</strong> artists · ' +
+                        '📋 <strong>' + data.total_playlists + '</strong> playlists';
+
+                    // Build tree
+                    treeEl.innerHTML = '';
+                    if (data.tree.length === 0) {
+                        treeEl.innerHTML = '<div style="color:#888; padding:10px; text-align:center;">No playlists found on this USB</div>';
+                        return;
+                    }
+                    renderUsbTree(data.tree, treeEl, 0);
+                })
+                .catch(function(e) {
+                    treeEl.innerHTML = '<div style="color:#ff6b6b; padding:10px;">❌ ' + escapeHtml(e.message) + '</div>';
+                });
+        }
+
+        function renderUsbTree(nodes, container, depth) {
+            nodes.forEach(function(node) {
+                var div = document.createElement('div');
+                div.style.paddingLeft = (depth * 20) + 'px';
+                div.style.marginBottom = '2px';
+
+                if (node.type === 'folder') {
+                    var header = document.createElement('div');
+                    header.style.cssText = 'cursor:pointer; padding:6px 8px; border-radius:4px; display:flex; align-items:center; gap:6px;';
+                    header.onmouseover = function() { this.style.background = '#252a33'; };
+                    header.onmouseout = function() { this.style.background = 'none'; };
+
+                    var arrow = document.createElement('span');
+                    arrow.textContent = '▶';
+                    arrow.style.cssText = 'font-size:10px; transition:transform 0.15s; color:#888; width:12px;';
+
+                    var icon = document.createElement('span');
+                    icon.textContent = '📁';
+
+                    var name = document.createElement('span');
+                    name.textContent = node.name;
+                    name.style.fontWeight = '500';
+
+                    var count = document.createElement('span');
+                    count.textContent = '(' + node.total_tracks + ' tracks)';
+                    count.style.cssText = 'color:#888; font-size:0.85em; margin-left:4px;';
+
+                    header.appendChild(arrow);
+                    header.appendChild(icon);
+                    header.appendChild(name);
+                    header.appendChild(count);
+
+                    var childContainer = document.createElement('div');
+                    childContainer.style.display = 'none';
+                    renderUsbTree(node.children, childContainer, depth + 1);
+
+                    header.onclick = function() {
+                        var open = childContainer.style.display !== 'none';
+                        childContainer.style.display = open ? 'none' : 'block';
+                        arrow.style.transform = open ? '' : 'rotate(90deg)';
+                    };
+
+                    div.appendChild(header);
+                    div.appendChild(childContainer);
+                } else {
+                    var row = document.createElement('div');
+                    row.style.cssText = 'padding:4px 8px; border-radius:4px; display:flex; align-items:center; gap:6px; cursor:pointer;';
+                    row.onmouseover = function() { this.style.background = '#252a33'; };
+                    row.onmouseout = function() { this.style.background = 'none'; };
+
+                    var icon = document.createElement('span');
+                    icon.textContent = '🎵';
+                    icon.style.fontSize = '0.85em';
+
+                    var name = document.createElement('span');
+                    name.textContent = node.name;
+                    name.style.fontSize = '0.95em';
+
+                    var cnt = document.createElement('span');
+                    cnt.textContent = '(' + node.track_count + ')';
+                    cnt.style.cssText = 'color:#888; font-size:0.85em;';
+
+                    row.appendChild(icon);
+                    row.appendChild(name);
+                    row.appendChild(cnt);
+
+                    // Click to expand track list
+                    var trackListDiv = document.createElement('div');
+                    trackListDiv.style.display = 'none';
+                    var tracksLoaded = false;
+
+                    row.onclick = function() {
+                        var open = trackListDiv.style.display !== 'none';
+                        trackListDiv.style.display = open ? 'none' : 'block';
+                        if (!tracksLoaded && node.tracks && node.tracks.length > 0) {
+                            tracksLoaded = true;
+                            var table = '<table style="width:100%; font-size:0.8em; margin:4px 0 8px ' + ((depth+1)*20) + 'px; color:#aaa; border-collapse:collapse;">';
+                            table += '<tr style="color:#666; border-bottom:1px solid #333;"><th style="text-align:left; padding:2px 8px;">#</th><th style="text-align:left; padding:2px 8px;">Title</th><th style="text-align:left; padding:2px 8px;">Artist</th><th style="text-align:right; padding:2px 8px;">BPM</th><th style="text-align:right; padding:2px 8px;">Duration</th></tr>';
+                            node.tracks.forEach(function(t, i) {
+                                var mins = Math.floor(t.duration / 60);
+                                var secs = ('0' + (t.duration % 60)).slice(-2);
+                                table += '<tr style="border-bottom:1px solid #222;">';
+                                table += '<td style="padding:2px 8px; color:#555;">' + (i+1) + '</td>';
+                                table += '<td style="padding:2px 8px;">' + escapeHtml(t.title) + '</td>';
+                                table += '<td style="padding:2px 8px; color:#999;">' + escapeHtml(t.artist) + '</td>';
+                                table += '<td style="padding:2px 8px; text-align:right;">' + (t.bpm || '-') + '</td>';
+                                table += '<td style="padding:2px 8px; text-align:right;">' + mins + ':' + secs + '</td>';
+                                table += '</tr>';
+                            });
+                            table += '</table>';
+                            trackListDiv.innerHTML = table;
+                        }
+                    };
+
+                    div.appendChild(row);
+                    div.appendChild(trackListDiv);
+                }
+                container.appendChild(div);
+            });
         }
     </script>
 </body>

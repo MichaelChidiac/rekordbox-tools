@@ -275,6 +275,13 @@ def init_usb_db(usb_con, usb_path: Path):
             "rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", cat)
 
+    # Copy djmdSort from master.db (required for Rekordbox to display content)
+    sort_cols = [d[0] for d in master.execute("SELECT * FROM djmdSort LIMIT 1").description]
+    for row in master.execute("SELECT * FROM djmdSort").fetchall():
+        usb_con.execute(
+            f"INSERT OR IGNORE INTO djmdSort ({','.join(sort_cols)}) "
+            f"VALUES ({','.join(['?']*len(row))})", row)
+
     master.close()
 
     db_id = str(make_id(str(usb_path)))
@@ -286,7 +293,7 @@ def init_usb_db(usb_con, usb_path: Path):
         "INSERT OR IGNORE INTO djmdProperty "
         "(DBID, DBVersion, BaseDBDrive, CurrentDBDrive, DeviceID, "
         "Reserved1, Reserved2, Reserved3, Reserved4, Reserved5, created_at, updated_at) "
-        "VALUES (?, '6.8.5', '/', '/', ?, '', '', '', '', '', ?, ?)",
+        "VALUES (?, '6000', '', '', ?, '', '', '', '', '', ?, ?)",
         (db_id, new_uuid(), now, now))
 
     # djmdDevice — register this USB as a known device
@@ -298,6 +305,8 @@ def init_usb_db(usb_con, usb_path: Path):
         (new_uuid(), db_id, usb_path.name, new_uuid(), now, now))
 
     usb_con.commit()
+    # Switch to WAL journal mode (matching Rekordbox's USB export format)
+    usb_con.execute("PRAGMA journal_mode=WAL")
 
 # ── Sync state helpers ─────────────────────────────────────────────────────────
 # Sync USN is stored in djmdProperty.Reserved1 (the real schema has no rb_local_usn
