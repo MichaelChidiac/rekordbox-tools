@@ -573,10 +573,15 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         for r in master.execute(f"""
             SELECT c.ID, c.FolderPath, c.FileNameL, c.Title, c.BPM, c.Length,
                    c.FileType, c.BitRate, c.SampleRate, c.Commnt, c.Rating,
-                   c.ColorID, c.KeyID, c.UUID, a.Name, al.Name, c.FileSize
+                   c.ColorID, c.KeyID, c.UUID, a.Name, al.Name, c.FileSize,
+                   c.GenreID, c.AlbumID, c.LabelID, c.ArtistID, c.RemixerID, c.OrgArtistID,
+                   c.ComposerID, c.Lyricist, c.ReleaseYear, c.DiscNo, c.TrackNo,
+                   g.Name, l.Name
             FROM djmdContent c
             LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
             LEFT JOIN djmdAlbum al ON c.AlbumID = al.ID
+            LEFT JOIN djmdGenre g ON c.GenreID = g.ID
+            LEFT JOIN djmdLabel l ON c.LabelID = l.ID
             WHERE c.ID IN ({ph2})
         """, list(tracks_to_process)).fetchall():
             tracks[r[0]] = r
@@ -598,6 +603,37 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             list(tracks_to_process)
         ).fetchall():
             cues.setdefault(r[1], []).append(r)
+
+    # ── Fetch genre/album/label lookup data from master.db ──────────────────
+    genre_rows_master = {}
+    album_rows_master = {}
+    label_rows_master = {}
+    if all_content_ids:
+        ph_all = ','.join('?' * len(all_content_ids))
+        # Genres used by our tracks
+        for r in master.execute(f"""
+            SELECT DISTINCT g.ID, g.Name FROM djmdGenre g
+            INNER JOIN djmdContent c ON c.GenreID = g.ID
+            WHERE c.ID IN ({ph_all}) AND g.rb_local_deleted=0
+        """, list(all_content_ids)).fetchall():
+            genre_rows_master[r[0]] = r
+
+        # Albums used by our tracks
+        for r in master.execute(f"""
+            SELECT DISTINCT al.ID, al.Name, al.AlbumArtistID, al.ImagePath, al.Compilation, al.SearchStr
+            FROM djmdAlbum al
+            INNER JOIN djmdContent c ON c.AlbumID = al.ID
+            WHERE c.ID IN ({ph_all}) AND al.rb_local_deleted=0
+        """, list(all_content_ids)).fetchall():
+            album_rows_master[r[0]] = r
+
+        # Labels used by our tracks
+        for r in master.execute(f"""
+            SELECT DISTINCT l.ID, l.Name FROM djmdLabel l
+            INNER JOIN djmdContent c ON c.LabelID = l.ID
+            WHERE c.ID IN ({ph_all}) AND l.rb_local_deleted=0
+        """, list(all_content_ids)).fetchall():
+            label_rows_master[r[0]] = r
 
     master.close()
 
@@ -695,6 +731,31 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         artist_cache[name] = aid
         return aid
 
+    # ── Insert genre/album/label lookup data ──────────────────────────────────
+    for gid, row in genre_rows_master.items():
+        usb_con.execute("""INSERT OR IGNORE INTO djmdGenre
+            (ID, Name, UUID, rb_data_status, rb_local_data_status,
+             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+            VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
+            (str(gid), row[1], new_uuid(), usn, usn, ts(), ts()))
+
+    for aid, row in album_rows_master.items():
+        usb_con.execute("""INSERT OR IGNORE INTO djmdAlbum
+            (ID, Name, AlbumArtistID, ImagePath, Compilation, SearchStr,
+             UUID, rb_data_status, rb_local_data_status,
+             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+            (str(aid), row[1], str(row[2]) if row[2] else '', '',
+             row[4] if row[4] is not None else 0, row[5] or '',
+             new_uuid(), usn, usn, ts(), ts()))
+
+    for lid, row in label_rows_master.items():
+        usb_con.execute("""INSERT OR IGNORE INTO djmdLabel
+            (ID, Name, UUID, rb_data_status, rb_local_data_status,
+             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+            VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
+            (str(lid), row[1], new_uuid(), usn, usn, ts(), ts()))
+
     # ── Remove deleted tracks ─────────────────────────────────────────────────
     if deleted_ids:
         ph_del = ','.join('?' * len(deleted_ids))
@@ -717,7 +778,11 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             print(f"  [{i}/{total}] Processing tracks…", end='\r')
 
         (db_id, folder_path, filename, title, bpm, length, ftype,
-         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name, album_name, file_size) = row
+         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid,
+         artist_name, album_name, file_size,
+         genre_id, album_id, label_id, master_artist_id, remixer_id, org_artist_id,
+         composer_id, lyricist, release_year, disc_no, track_no,
+         genre_name, label_name) = row
 
         # Audio
         artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
@@ -810,13 +875,13 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             usn, rb_local_usn, created_at, updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(db_id), usb_audio_rel, filename, file_name_s,
-             title or filename, artist_id, '', '',
-             bpm, length, 0, bitrate, 0, comment, ftype, rating or 0,
-             0, '', '', '', key_id, '', color_id,
+             title or filename, artist_id, str(album_id) if album_id else '', str(genre_id) if genre_id else '',
+             bpm, length, track_no or 0, bitrate, 0, comment, ftype, rating or 0,
+             release_year or 0, str(remixer_id) if remixer_id else '', str(label_id) if label_id else '', str(org_artist_id) if org_artist_id else '', key_id, '', color_id,
              0, '', usb_db_id, str(db_id), anlz_data_path or '',
-             search_str, file_size or 0, 0, '', '', samplerate,
+             search_str, file_size or 0, disc_no or 0, str(composer_id) if composer_id else '', '', samplerate,
              0, 1, '', ts(), 0, '',
-             '', '', '', '', '', '', '', '', '',
+             '', '', '', '', '', '', '', lyricist or '', '',
              0, 0, 0.0, '', 0, 0, '',
              '', '', '', '', '',
              '', '', '',
