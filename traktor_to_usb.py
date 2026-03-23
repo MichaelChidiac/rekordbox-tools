@@ -522,6 +522,12 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         if last_usn:
             print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
 
+    # When DLP is detected, the DB will be deleted and recreated fresh —
+    # treat all tracks as new so they all get inserted into the new djmd DB
+    if is_dlp:
+        existing_ids = set()
+        last_usn = 0
+
     # ── Compute tracks to process and deletions based on mode ────────────────
     changed_ids = set()
 
@@ -567,7 +573,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         for r in master.execute(f"""
             SELECT c.ID, c.FolderPath, c.FileNameL, c.Title, c.BPM, c.Length,
                    c.FileType, c.BitRate, c.SampleRate, c.Commnt, c.Rating,
-                   c.ColorID, c.KeyID, c.UUID, a.Name, al.Name
+                   c.ColorID, c.KeyID, c.UUID, a.Name, al.Name, c.FileSize
             FROM djmdContent c
             LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
             LEFT JOIN djmdAlbum al ON c.AlbumID = al.ID
@@ -711,7 +717,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             print(f"  [{i}/{total}] Processing tracks…", end='\r')
 
         (db_id, folder_path, filename, title, bpm, length, ftype,
-         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name, album_name) = row
+         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name, album_name, file_size) = row
 
         # Audio
         artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
@@ -808,7 +814,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
              bpm, length, 0, bitrate, 0, comment, ftype, rating or 0,
              0, '', '', '', key_id, '', color_id,
              0, '', usb_db_id, str(db_id), anlz_data_path or '',
-             search_str, 0, 0, '', '', samplerate,
+             search_str, file_size or 0, 0, '', '', samplerate,
              0, 1, '', ts(), 0, '',
              '', '', '', '', '', '', '', '', '',
              0, 0, 0.0, '', 0, 0, '',
@@ -1471,6 +1477,19 @@ def main():
             if db_path.exists():
                 print("\n🔨 Generating export.pdb ...")
                 pdb_data = read_export_db(db_path)
+                # Fill in missing file sizes from actual USB audio files
+                contents_dir = usb_path / "Contents"
+                fixed_sizes = 0
+                for t in pdb_data.get("tracks", []):
+                    if not t.get("fileSize"):
+                        fp = t.get("filePath", "")
+                        if fp:
+                            full = usb_path / fp.lstrip("/")
+                            if full.exists():
+                                t["fileSize"] = full.stat().st_size
+                                fixed_sizes += 1
+                if fixed_sizes:
+                    print(f"  📏 Filled {fixed_sizes} file sizes from USB filesystem")
                 pdb_bytes = build_pdb(pdb_data)
                 if args.dry_run:
                     print(f"  Would write {len(pdb_bytes):,} bytes to {pdb_path}")
