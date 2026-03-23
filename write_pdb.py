@@ -304,7 +304,8 @@ class PdbWriter:
         struct.pack_into("<H", page, 0x1E, used_size & 0xFFFF)
 
         if is_index:
-            # IndexPageHeader: 2 × u4
+            # First 4 bytes of index content area (unknown_a + unknown_b)
+            # Full IndexPageContent is written by _write_index_content()
             struct.pack_into("<I", page, 0x20, index_unk1)
             struct.pack_into("<I", page, 0x24, index_unk2)
         else:
@@ -313,6 +314,56 @@ class PdbWriter:
             struct.pack_into("<H", page, 0x22, dph_unk_nrl & 0xFFFF)
             struct.pack_into("<H", page, 0x24, dph_unk6 & 0xFFFF)
             struct.pack_into("<H", page, 0x26, dph_unk7 & 0xFFFF)
+
+    @staticmethod
+    def _write_index_content(page: bytearray, header_page_idx: int,
+                             first_data_page_idx: int,
+                             data_page_indices: list[int]):
+        """Write the IndexPageContent after the 32-byte PageHeader.
+
+        Layout (at offset 0x20):
+          u16  unknown_a       (0x1FFF)
+          u16  unknown_b       (0x1FFF)
+          u16  magic           (0x03EC)
+          u16  next_offset     (= num_entries)
+          u32  page_index      (self-reference to header page)
+          u32  next_page       (first data page)
+          u64  magic           (0x0000_0000_03FF_FFFF)
+          u16  num_entries
+          u16  first_empty     (0x1FFF = no empty slots)
+        Total header: 28 bytes
+
+        Followed by IndexEntry values (u32 each):
+          Non-empty: (data_page_index << 3) | 0
+          Empty:     0x1FFF_FFF8
+        Max entries per 4096-byte page: (4096 - 32 - 28 - 20) / 4 = 1004
+        Last 20 bytes of page: zeros (already zero from bytearray init).
+        """
+        EMPTY_ENTRY = 0x1FFF_FFF8
+        MAX_ENTRIES = (PAGE_SIZE - 32 - 28 - 20) // 4  # 1004
+
+        num_entries = min(len(data_page_indices), MAX_ENTRIES)
+        off = 0x20
+
+        # IndexPageHeader (28 bytes)
+        struct.pack_into("<H", page, off, 0x1FFF)       # unknown_a
+        struct.pack_into("<H", page, off + 2, 0x1FFF)   # unknown_b
+        struct.pack_into("<H", page, off + 4, 0x03EC)   # magic
+        struct.pack_into("<H", page, off + 6, num_entries)  # next_offset
+        struct.pack_into("<I", page, off + 8, header_page_idx)  # page_index
+        struct.pack_into("<I", page, off + 12, first_data_page_idx)  # next_page
+        struct.pack_into("<Q", page, off + 16, 0x0000_0000_03FF_FFFF)  # magic
+        struct.pack_into("<H", page, off + 24, num_entries)  # num_entries
+        struct.pack_into("<H", page, off + 26, 0x1FFF)  # first_empty
+
+        # Index entries start at offset 0x3C (0x20 + 28)
+        entries_off = 0x3C
+        for i in range(MAX_ENTRIES):
+            if i < num_entries:
+                entry = (data_page_indices[i] << 3) | 0  # flags = 0
+            else:
+                entry = EMPTY_ENTRY
+            struct.pack_into("<I", page, entries_off + i * 4, entry)
 
     def _build_data_page(self, rows_data: list[bytes], table_type: int,
                          page_counter: int) -> bytearray:
@@ -416,6 +467,9 @@ class PdbWriter:
                 unk10=1, flags=0x64,
                 is_index=True, index_unk1=0x1FFF1FFF, index_unk2=1004,
             )
+            # Write empty index content (num_entries=0, all empty entries)
+            self._write_index_content(
+                header_page, header_idx, empty_idx, [])
             # Leave empty_page as all zeros (matches reference format)
 
             self.table_info.append({
@@ -444,13 +498,17 @@ class PdbWriter:
                 struct.pack_into("<I", page_buf, 0x0C, page_indices[i + 1])
             # Last page's next_page is set after all tables are allocated
 
-        # Write header page
+        # Write header page (32-byte PageHeader)
         first_data = page_indices[0]
         self._write_page_header(
             header_page, header_idx, table_type, first_data,
             unk10=1, flags=0x64,
             is_index=True, index_unk1=0x1FFF1FFF, index_unk2=1004,
         )
+
+        # Write index page content (IndexPageHeader + index entries)
+        self._write_index_content(
+            header_page, header_idx, first_data, page_indices)
 
         last_data = page_indices[-1]
         self.table_info.append({
