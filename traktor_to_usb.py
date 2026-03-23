@@ -1270,6 +1270,8 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
         out.execute("INSERT OR IGNORE INTO sort VALUES (?,?,?,?,?)", (sid, sid, sid - 1, 1, 0))
 
     out.commit()
+    # Switch to WAL mode (Rekordbox expects WAL journal mode)
+    out.execute("PRAGMA journal_mode=wal")
     out.close()
 
     out_size = os.path.getsize(output_path)
