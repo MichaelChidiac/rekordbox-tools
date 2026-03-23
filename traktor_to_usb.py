@@ -137,6 +137,49 @@ def open_export_db(path, key=EXPORT_KEY):
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
+def read_existing_usb_state(usb_db_path):
+    """Read existing track IDs and USN from USB database, handling both DLP and djmd formats.
+
+    Returns (existing_ids: set, last_usn: int, is_dlp: bool).
+    Tries DLP format first (SQLCipher 4 defaults, export key), then falls back
+    to djmd format (legacy SQLCipher, master.db key).
+    """
+    existing_ids = set()
+    last_usn = 0
+    is_dlp = False
+
+    if not usb_db_path.exists():
+        return existing_ids, last_usn, is_dlp
+
+    # Try DLP format first (SQLCipher 4 defaults, export key)
+    try:
+        con = open_export_db(usb_db_path)
+        con.execute("SELECT COUNT(*) FROM content")  # test query
+        existing_ids = set(
+            str(r[0]) for r in con.execute("SELECT content_id FROM content").fetchall()
+        )
+        # DLP doesn't have USN tracking — treat as 0
+        last_usn = 0
+        is_dlp = True
+        con.close()
+        return existing_ids, last_usn, is_dlp
+    except Exception:
+        pass
+
+    # Try djmd format (legacy SQLCipher, master.db key)
+    try:
+        con = open_db(usb_db_path)
+        last_usn = get_last_sync_usn(con)
+        existing_ids = set(
+            str(r[0]) for r in con.execute("SELECT ID FROM djmdContent").fetchall()
+        )
+        con.close()
+        return existing_ids, last_usn, is_dlp
+    except Exception:
+        pass
+
+    return existing_ids, last_usn, is_dlp
+
 # ── Auto-detect USB ────────────────────────────────────────────────────────────
 def detect_pioneer_usbs():
     """Return list of mounted Pioneer USB paths."""
@@ -472,21 +515,12 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     print(f"  Total tracks in scope: {len(all_content_ids)}")
 
     # ── Determine existing USB state ─────────────────────────────────────────
-    existing_ids = set()
-    last_usn = 0
-    if usb_db_path.exists():
-        try:
-            usb_con_check = open_db(usb_db_path)
-            last_usn = get_last_sync_usn(usb_con_check)
-            existing_ids = set(
-                r[0] for r in usb_con_check.execute("SELECT ID FROM djmdContent").fetchall()
-            )
-            usb_con_check.close()
+    existing_ids, last_usn, is_dlp = read_existing_usb_state(usb_db_path)
+    if existing_ids:
+        fmt = "Device Library Plus" if is_dlp else "djmd"
+        print(f"  Existing USB: {len(existing_ids)} tracks ({fmt} format)")
+        if last_usn:
             print(f"  Last sync USN: {last_usn}  →  master USN: {max_master_usn}")
-        except Exception as e:
-            print(f"  ⚠️  Could not read USB DB: {e}")
-            print(f"  Tip: Ensure USB is still connected and not being accessed by Rekordbox")
-            raise
 
     # ── Compute tracks to process and deletions based on mode ────────────────
     changed_ids = set()
@@ -533,9 +567,10 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         for r in master.execute(f"""
             SELECT c.ID, c.FolderPath, c.FileNameL, c.Title, c.BPM, c.Length,
                    c.FileType, c.BitRate, c.SampleRate, c.Commnt, c.Rating,
-                   c.ColorID, c.KeyID, c.UUID, a.Name
+                   c.ColorID, c.KeyID, c.UUID, a.Name, al.Name
             FROM djmdContent c
             LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
+            LEFT JOIN djmdAlbum al ON c.AlbumID = al.ID
             WHERE c.ID IN ({ph2})
         """, list(tracks_to_process)).fetchall():
             tracks[r[0]] = r
@@ -621,6 +656,15 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     for d in [usb_rb_dir, usb_anlz, usb_audio]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # If existing DB is DLP format, remove it so we can create fresh djmd DB
+    # (will be converted back to DLP at the end)
+    if is_dlp and usb_db_path.exists():
+        for ext in ['', '-wal', '-shm']:
+            p = Path(str(usb_db_path) + ext)
+            if p.exists():
+                p.unlink()
+        print("  Removed existing DLP database (will recreate)")
+
     is_fresh = not usb_db_path.exists()
     usb_con = open_db(usb_db_path)
     if is_fresh:
@@ -667,17 +711,18 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             print(f"  [{i}/{total}] Processing tracks…", end='\r')
 
         (db_id, folder_path, filename, title, bpm, length, ftype,
-         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name) = row
+         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid, artist_name, album_name) = row
 
         # Audio
         artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
+        album_slug = (album_name or 'Unknown Album').replace('/', '_').replace(':', '_')[:50]
         src_audio = Path(folder_path) if folder_path else None
         got_audio = False
 
         if src_audio and src_audio.exists():
             # File exists locally — copy to USB
-            dst_dir = usb_audio / artist_slug
-            dst_dir.mkdir(exist_ok=True)
+            dst_dir = usb_audio / artist_slug / album_slug
+            dst_dir.mkdir(parents=True, exist_ok=True)
             dst_audio = dst_dir / filename
             if not dst_audio.exists():
                 safe_copy(src_audio, dst_audio)
@@ -689,8 +734,8 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         elif fetch_nas and folder_path and folder_path in nas_available:
             # File missing locally but available on NAS — download to USB
             from nas_lookup import download_from_nas, TRAKTOR_ML_API
-            dst_dir = usb_audio / artist_slug
-            dst_dir.mkdir(exist_ok=True)
+            dst_dir = usb_audio / artist_slug / album_slug
+            dst_dir.mkdir(parents=True, exist_ok=True)
             dst_audio = dst_dir / filename
             if dst_audio.exists():
                 skipped_audio += 1
@@ -706,7 +751,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         if not got_audio:
             if cid in existing_ids:
                 # Track already on USB — keep its audio, just update DB entry
-                usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
+                usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{album_slug}/{filename}"
                 skipped_audio += 1
             else:
                 # Track is genuinely missing — skip entirely
@@ -715,7 +760,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
                 continue
 
         else:
-            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{filename}"
+            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{album_slug}/{filename}"
 
         # ANLZ
         for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
@@ -934,18 +979,29 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         audio_dir = usb_path / AUDIO_DIR
         if audio_dir.exists():
             stale_files = 0
+            failed_deletes = 0
             for audio_file in audio_dir.rglob('*'):
                 if audio_file.is_file():
                     rel_path = '/' + str(audio_file.relative_to(usb_path))
                     if rel_path not in db_paths:
-                        audio_file.unlink()
-                        stale_files += 1
-            # Clean up empty artist directories
-            for d in audio_dir.iterdir():
-                if d.is_dir() and not any(d.iterdir()):
-                    d.rmdir()
-            if stale_files:
-                print(f"  🧹 Removed {stale_files} stale audio files from {AUDIO_DIR}/")
+                        try:
+                            audio_file.unlink()
+                            stale_files += 1
+                        except OSError:
+                            failed_deletes += 1
+            # Clean up empty directories (album dirs first, then artist dirs)
+            for d in sorted(audio_dir.rglob('*'), reverse=True):
+                if d.is_dir():
+                    try:
+                        if not any(d.iterdir()):
+                            d.rmdir()
+                    except OSError:
+                        pass
+            if stale_files or failed_deletes:
+                msg = f"  🧹 Removed {stale_files} stale audio files from {AUDIO_DIR}/"
+                if failed_deletes:
+                    msg += f" ({failed_deletes} could not be removed — exFAT Unicode issue)"
+                print(msg)
 
     # ── Push mode: rebuild manifest from USB DB to include all playlists ──────
     if mode == 'push':
@@ -1056,7 +1112,7 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
     ).fetchall()
 
     album_rows = src.execute(
-        "SELECT ID, Name, ArtistID, ImagePath, Compilation, SearchStr FROM djmdAlbum WHERE rb_local_deleted=0"
+        "SELECT ID, Name, AlbumArtistID, ImagePath, Compilation, SearchStr FROM djmdAlbum WHERE rb_local_deleted=0"
     ).fetchall()
 
     genre_rows = src.execute("SELECT ID, Name FROM djmdGenre WHERE rb_local_deleted=0").fetchall()
@@ -1430,25 +1486,32 @@ def main():
         # (Rekordbox desktop reads the DLP format, not the djmd format)
         db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
         if db_path.exists():
-            print("\n🔄 Converting to Device Library Plus format ...")
-            dlp_path = db_path.parent / "exportLibrary_dlp.db"
-            try:
-                if convert_to_device_library_plus(db_path, dlp_path, args.dry_run):
-                    if not args.dry_run:
-                        # Replace old DB with new DLP DB
-                        for ext in ['', '-wal', '-shm']:
-                            old = Path(str(db_path) + ext)
-                            if old.exists():
-                                old.unlink()
-                        dlp_path.rename(db_path)
-                        print("  ✅ exportLibrary.db now in Device Library Plus format")
-            except Exception as e:
-                print(f"  ⚠️  DLP conversion failed: {e}")
-                import traceback
-                traceback.print_exc()
-                # Clean up partial output
-                if dlp_path.exists():
-                    dlp_path.unlink()
+            # In dry-run mode, the DB on disk may still be DLP from a previous export
+            # (we didn't actually delete/recreate it). Detect and skip gracefully.
+            _, _, db_is_dlp = read_existing_usb_state(db_path)
+            if args.dry_run and db_is_dlp:
+                print("\n🔄 Converting to Device Library Plus format ...")
+                print("  Would convert djmd DB to Device Library Plus format")
+            else:
+                print("\n🔄 Converting to Device Library Plus format ...")
+                dlp_path = db_path.parent / "exportLibrary_dlp.db"
+                try:
+                    if convert_to_device_library_plus(db_path, dlp_path, args.dry_run):
+                        if not args.dry_run:
+                            # Replace old DB with new DLP DB
+                            for ext in ['', '-wal', '-shm']:
+                                old = Path(str(db_path) + ext)
+                                if old.exists():
+                                    old.unlink()
+                            dlp_path.rename(db_path)
+                            print("  ✅ exportLibrary.db now in Device Library Plus format")
+                except Exception as e:
+                    print(f"  ⚠️  DLP conversion failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Clean up partial output
+                    if dlp_path.exists():
+                        dlp_path.unlink()
 
         print("\n✅ Export completed successfully")
 
