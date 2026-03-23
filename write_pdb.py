@@ -203,11 +203,11 @@ def serialize_track_row(t: dict) -> bytes:
     fixed.extend(struct.pack("<H", t.get("year", 0)))
     fixed.extend(struct.pack("<H", t.get("sampleDepth", 16)))
     fixed.extend(struct.pack("<H", t.get("duration", 0)))
-    fixed.extend(struct.pack("<H", 0))        # _unnamed26
+    fixed.extend(struct.pack("<H", 0x0029))   # u5 (always 0x29 per Deep Symmetry)
     fixed.append(t.get("colorId", 0) & 0xFF)  # colorId (u1)
     fixed.append(t.get("rating", 0) & 0xFF)   # rating (u1)
-    fixed.extend(struct.pack("<H", 0))        # _unnamed29
-    fixed.extend(struct.pack("<H", 0))        # _unnamed30
+    fixed.extend(struct.pack("<H", t.get("fileType", 1)))  # file_type (1=MP3,4=M4A,5=FLAC,11=WAV,12=AIFF)
+    fixed.extend(struct.pack("<H", 0x0003))   # u7 (always 3, precedes string offsets)
     assert len(fixed) == 94
 
     # ── String fields (21 fields) ──────────────────────────────────────────
@@ -264,27 +264,47 @@ class PdbWriter:
 
     @staticmethod
     def _write_page_header(page: bytearray, page_idx: int, table_type: int,
-                           next_page: int, *, unk10: int = 0, nrows: int = 0,
-                           unk1a: int = 0, flags: int = 0, free_size: int = 0,
-                           used_size: int = 0, unk20: int = 0,
-                           nrows_large: int = 0, unk24: int = 0, unk26: int = 0):
-        """Write the 40-byte page header."""
-        struct.pack_into("<I", page, 0x00, 0)            # gap
+                           next_page: int, *, unk10: int = 0,
+                           num_rows: int = 0, num_rows_valid: int = 0,
+                           flags: int = 0, free_size: int = 0,
+                           used_size: int = 0,
+                           is_index: bool = False, index_unk1: int = 0,
+                           index_unk2: int = 0,
+                           dph_unk5: int = 0, dph_unk_nrl: int = 0,
+                           dph_unk6: int = 0, dph_unk7: int = 0):
+        """Write the 40-byte page header (32-byte PageHeader + 8-byte content header).
+
+        Bytes 0x18-0x1A: packed_row_counts = num_rows(13 bits) | (num_rows_valid(11 bits) << 13)
+        Byte 0x1B: page_flags
+        Bytes 0x20-0x27: IndexPageHeader (2×u4) or DataPageHeader (4×u2)
+        """
+        struct.pack_into("<I", page, 0x00, 0)            # gap (always 0)
         struct.pack_into("<I", page, 0x04, page_idx)
         struct.pack_into("<I", page, 0x08, table_type)
         struct.pack_into("<I", page, 0x0C, next_page)
         struct.pack_into("<I", page, 0x10, unk10)
         struct.pack_into("<I", page, 0x14, 0)
-        page[0x18] = nrows & 0xFF
-        page[0x19] = 0
-        page[0x1A] = unk1a & 0xFF
+
+        # packed_row_counts: 24-bit packed field (3 bytes LE)
+        packed = (num_rows & 0x1FFF) | ((num_rows_valid & 0x7FF) << 13)
+        page[0x18] = packed & 0xFF
+        page[0x19] = (packed >> 8) & 0xFF
+        page[0x1A] = (packed >> 16) & 0xFF
         page[0x1B] = flags & 0xFF
+
         struct.pack_into("<H", page, 0x1C, free_size & 0xFFFF)
         struct.pack_into("<H", page, 0x1E, used_size & 0xFFFF)
-        struct.pack_into("<H", page, 0x20, unk20 & 0xFFFF)
-        struct.pack_into("<H", page, 0x22, nrows_large & 0xFFFF)
-        struct.pack_into("<H", page, 0x24, unk24 & 0xFFFF)
-        struct.pack_into("<H", page, 0x26, unk26 & 0xFFFF)
+
+        if is_index:
+            # IndexPageHeader: 2 × u4
+            struct.pack_into("<I", page, 0x20, index_unk1)
+            struct.pack_into("<I", page, 0x24, index_unk2)
+        else:
+            # DataPageHeader: 4 × u2
+            struct.pack_into("<H", page, 0x20, dph_unk5 & 0xFFFF)
+            struct.pack_into("<H", page, 0x22, dph_unk_nrl & 0xFFFF)
+            struct.pack_into("<H", page, 0x24, dph_unk6 & 0xFFFF)
+            struct.pack_into("<H", page, 0x26, dph_unk7 & 0xFFFF)
 
     def _build_data_page(self, rows_data: list[bytes], table_type: int,
                          page_counter: int) -> bytearray:
@@ -321,25 +341,22 @@ class PdbWriter:
                     struct.pack_into("<H", page, slot_pos, row_offsets[row_global])
                     present_flags |= (1 << r)
 
-            # Flags and padding at end of group
+            # Flags and unknown field at end of group
             struct.pack_into("<H", page, grp_offset + 32, present_flags)
-            struct.pack_into("<H", page, grp_offset + 34, present_flags)
+            struct.pack_into("<H", page, grp_offset + 34, 0)  # unknown (always 0 for fresh data)
 
         # ── Page header ───────────────────────────────────────────────────
-        page_flags = 0x34 if nrows > ROWS_PER_GROUP else 0x24
-        # numRowsSmall is u1 (max 255); for larger counts, the parser uses
-        # numRowsLarge when numRowsLarge > numRowsSmall && numRowsLarge != 8191
-        nrows_large = nrows if nrows > 255 else 0
+        # numRowsLarge at 0x22: set to actual count when > 255 (overflow for u1 numRowsSmall)
         self._write_page_header(
             page, 0, table_type, 0,  # page_idx and next_page set later
             unk10=page_counter,
-            nrows=nrows,
-            unk1a=1 if nrows > 0 else 0,
-            flags=page_flags,
+            num_rows=nrows,
+            num_rows_valid=nrows,
+            flags=0x24,  # normal data page (no deleted rows)
             free_size=free_size,
             used_size=used_size,
-            unk20=nrows if nrows <= 255 else 0,
-            nrows_large=nrows_large,
+            dph_unk5=nrows,
+            dph_unk_nrl=nrows if nrows > 255 else 0,
         )
         return page
 
@@ -388,8 +405,8 @@ class PdbWriter:
             empty_idx, empty_page = self._alloc_page()
             self._write_page_header(
                 header_page, header_idx, table_type, empty_idx,
-                unk10=1, flags=0x64, unk24=1004,
-                unk20=0x1FFF, nrows_large=0x1FFF,
+                unk10=1, flags=0x64,
+                is_index=True, index_unk1=0x1FFF1FFF, index_unk2=1004,
             )
             # Minimal sentinel page (type & index only)
             struct.pack_into("<I", empty_page, 0x04, empty_idx)
@@ -425,8 +442,8 @@ class PdbWriter:
         first_data = page_indices[0]
         self._write_page_header(
             header_page, header_idx, table_type, first_data,
-            unk10=1, flags=0x64, unk24=1004,
-            unk20=0x1FFF, nrows_large=0x1FFF,
+            unk10=1, flags=0x64,
+            is_index=True, index_unk1=0x1FFF1FFF, index_unk2=1004,
         )
 
         last_data = page_indices[-1]
@@ -438,32 +455,38 @@ class PdbWriter:
             "_data_page_indices": page_indices,
         })
 
-    def finalize(self) -> bytes:
+    def finalize(self, num_tables: int = NUM_TABLES) -> bytes:
         """Build file header (page 0) and finalize all page links.
 
         Returns the complete PDB file as bytes.
         """
-        # Determine next_unused page (for empty_candidate pointers)
-        next_unused = len(self.pages)
-
-        # Fix up empty_candidate and last-page next_page links
+        # Allocate sentinel (empty) pages for each populated table's empty_candidate
         for info in self.table_info:
             if info["empty_candidate"] == -1:
-                # Populated table — empty_candidate = next_unused
-                info["empty_candidate"] = next_unused
-                next_unused += 1
+                sentinel_idx, sentinel_page = self._alloc_page()
+                info["empty_candidate"] = sentinel_idx
 
-                # Set last data page's next_page to its empty_candidate
+                # Write a minimal empty data page header for the sentinel
+                table_type = info["type"]
+                self._write_page_header(
+                    sentinel_page, sentinel_idx, table_type, sentinel_idx,
+                    flags=0x24,
+                    dph_unk5=0, dph_unk_nrl=0x1FFF,
+                )
+
+                # Set last data page's next_page to sentinel
                 dp_indices = info.get("_data_page_indices", [])
                 if dp_indices:
                     last_pg = self.pages[dp_indices[-1]]
-                    struct.pack_into("<I", last_pg, 0x0C, info["empty_candidate"])
+                    struct.pack_into("<I", last_pg, 0x0C, sentinel_idx)
+
+        next_unused = len(self.pages)
 
         # Build page 0 (file header)
         page0 = bytearray(PAGE_SIZE)
         struct.pack_into("<I", page0, 0x00, 0)             # padding
         struct.pack_into("<I", page0, 0x04, PAGE_SIZE)      # page size
-        struct.pack_into("<I", page0, 0x08, NUM_TABLES)     # num tables
+        struct.pack_into("<I", page0, 0x08, num_tables)     # num tables
         struct.pack_into("<I", page0, 0x0C, next_unused)    # next unused page
         struct.pack_into("<I", page0, 0x10, 5)              # unknown (always 5)
         struct.pack_into("<I", page0, 0x14, 0)              # sequence
@@ -690,6 +713,13 @@ def read_export_db(db_path: Path) -> dict:
         # Color ID: stored as string in DB, convert to int
         color_id = safe_int(row[5])
 
+        # File type from extension (1=MP3, 4=M4A, 5=FLAC, 11=WAV, 12=AIFF)
+        file_type = 1  # default MP3
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        FILE_TYPE_MAP = {"mp3": 1, "m4a": 4, "aac": 4, "flac": 5,
+                         "wav": 11, "aiff": 12, "aif": 12}
+        file_type = FILE_TYPE_MAP.get(ext, 1)
+
         tracks.append({
             "id": track_id,
             "title": row[1] or "",
@@ -714,6 +744,7 @@ def read_export_db(db_path: Path) -> dict:
             "sampleDepth": bit_depth if bit_depth else 16,
             "duration": length_sec & 0xFFFF,
             "rating": rating & 0xFF,
+            "fileType": file_type,
             # String fields
             "isrc": isrc,
             "texter": lyricist,
@@ -815,6 +846,15 @@ def build_pdb(data: dict) -> bytes:
     return writer.finalize()
 
 
+def build_ext_pdb() -> bytes:
+    """Build a minimal exportExt.pdb with 9 empty tables (types 0-8)."""
+    writer = PdbWriter()
+    writer._alloc_page()  # page 0: file header
+    for t in range(9):
+        writer.write_table(t, [])
+    return writer.finalize(num_tables=9)
+
+
 # ── Backup ────────────────────────────────────────────────────────────────────
 
 def backup_pdb(pdb_path: Path) -> Path:
@@ -855,6 +895,7 @@ def main():
 
     db_path = pioneer_dir / "exportLibrary.db"
     pdb_path = pioneer_dir / "export.pdb"
+    ext_pdb_path = pioneer_dir / "exportExt.pdb"
 
     if not db_path.exists():
         print(f"❌ exportLibrary.db not found: {db_path}", file=sys.stderr)
@@ -888,6 +929,7 @@ def main():
 
     if args.dry_run:
         print(f"\n🏁 Dry run — would write {len(pdb_bytes):,} bytes to {pdb_path}")
+        print(f"    and exportExt.pdb ({len(build_ext_pdb()):,} bytes)")
         return
 
     # ── Backup existing PDB ───────────────────────────────────────────────
@@ -898,6 +940,13 @@ def main():
     print(f"\n💾 Writing: {pdb_path}")
     pdb_path.write_bytes(pdb_bytes)
     print(f"  ✅ Written {len(pdb_bytes):,} bytes ({num_pages} pages)")
+
+    # ── Write exportExt.pdb ──────────────────────────────────────────────
+    ext_bytes = build_ext_pdb()
+    if ext_pdb_path.exists():
+        backup_pdb(ext_pdb_path)
+    ext_pdb_path.write_bytes(ext_bytes)
+    print(f"  ✅ Written exportExt.pdb ({len(ext_bytes):,} bytes)")
 
     print(f"\n✅ Done! Verify with: node read_usb_pdb.js \"{usb_path}\" --summary")
 
