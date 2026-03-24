@@ -407,11 +407,13 @@ def get_playlist_tree(con):
     return tree
 
 def collect_playlist_ids(tree, selected_roots):
-    """Return set of playlist IDs under any of the selected root names."""
+    """Return set of playlist IDs under any of the selected root names (case-insensitive)."""
     selected = set()
+    # Normalize selected roots to lowercase for case-insensitive matching
+    selected_lower = {s.lower() for s in selected_roots} if selected_roots else set()
     for path, (pl_id, attr) in tree.items():
         if attr == 0:
-            if not selected_roots or any(seg in selected_roots for seg in path):
+            if not selected_roots or any(seg.lower() in selected_lower for seg in path):
                 selected.add(pl_id)
     return selected
 
