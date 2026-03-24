@@ -1421,6 +1421,102 @@ def safe_int(val, default=0):
     except (ValueError, TypeError):
         return default
 
+# ── PDB Generation (Rust) ──────────────────────────────────────────────────────
+
+PDB_WRITER_BIN = Path(__file__).parent / "bin" / "pdb_writer"
+
+def _generate_pdb_rust(db_path: Path, pdb_path: Path, usb_path: Path):
+    """Generate export.pdb using the Rust PDB writer (reads DLP-format DB)."""
+    import json, subprocess, tempfile
+    sys.path.insert(0, str(Path(__file__).parent))
+    from export_pdb_json import export_dlp
+
+    # Read DLP and get JSON data
+    data = export_dlp(str(db_path))
+
+    # Fill in missing file sizes from USB filesystem
+    fixed = 0
+    for t in data.get("tracks", []):
+        if not t.get("file_size"):
+            fp = t.get("file_path", "")
+            # Strip DeviceSQL markers
+            clean = fp.replace("\ufffa", "").replace("\ufffb", "")
+            if clean:
+                full = usb_path / clean.lstrip("/")
+                if full.exists():
+                    t["file_size"] = full.stat().st_size
+                    fixed += 1
+    if fixed:
+        print(f"  Filled {fixed} file sizes from USB filesystem")
+
+    # Write JSON to temp file, call Rust binary
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as jf:
+        json.dump(data, jf)
+        json_path = jf.name
+
+    try:
+        result = subprocess.run(
+            [str(PDB_WRITER_BIN), json_path, str(pdb_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"pdb_writer failed: {result.stderr}")
+        # Print the writer's status output
+        for line in result.stderr.strip().split('\n'):
+            if line:
+                print(f"  {line}")
+    finally:
+        Path(json_path).unlink(missing_ok=True)
+
+
+def _generate_ext_pdb(ext_pdb_path: Path):
+    """Generate a minimal exportExt.pdb (9 empty tables)."""
+    import struct
+    PAGE_SIZE = 4096
+    NUM_TABLES = 9
+    num_pages = 1 + NUM_TABLES * 2
+    output = bytearray(num_pages * PAGE_SIZE)
+
+    # Header
+    struct.pack_into('<I', output, 4, PAGE_SIZE)
+    struct.pack_into('<I', output, 8, NUM_TABLES)
+    struct.pack_into('<I', output, 12, num_pages)
+    struct.pack_into('<I', output, 16, 5)    # unknown
+    struct.pack_into('<I', output, 20, 100)  # sequence
+
+    # Table directory
+    for i in range(NUM_TABLES):
+        idx_pg = 1 + i * 2
+        sentinel_pg = 2 + i * 2
+        off = 28 + i * 16
+        struct.pack_into('<IIII', output, off, i, sentinel_pg, idx_pg, idx_pg)
+
+    # Index pages
+    for i in range(NUM_TABLES):
+        idx_pg = 1 + i * 2
+        sentinel_pg = 2 + i * 2
+        p = idx_pg * PAGE_SIZE
+        struct.pack_into('<I', output, p + 4, idx_pg)        # page_index
+        struct.pack_into('<I', output, p + 8, i)              # page_type
+        struct.pack_into('<I', output, p + 12, sentinel_pg)   # next_page
+        struct.pack_into('<I', output, p + 16, 1)             # unknown1
+        output[p + 27] = 0x64                                 # page_flags (index)
+        # IndexPageHeader at offset 32
+        ih = p + 32
+        struct.pack_into('<HH', output, ih, 0x1FFF, 0x1FFF)
+        struct.pack_into('<H', output, ih + 4, 0x03EC)        # magic
+        struct.pack_into('<I', output, ih + 8, idx_pg)         # page_index
+        struct.pack_into('<I', output, ih + 12, 0x03FFFFFF)    # next_page (null)
+        struct.pack_into('<Q', output, ih + 16, 0x0000000003FFFFFF)
+        struct.pack_into('<H', output, ih + 26, 0x1FFF)       # first_empty
+        # Fill empty index entries
+        for e in range(p + 60, p + PAGE_SIZE - 20, 4):
+            struct.pack_into('<I', output, e, 0x1FFFFFF8)
+
+    ext_pdb_path.write_bytes(output)
+    print(f"  Written exportExt.pdb ({len(output):,} bytes)")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
@@ -1541,40 +1637,9 @@ def main():
 
         export_to_usb(usb_path, playlist_ids, tree, sync_mode, args.dry_run, args.fetch_nas)
 
-        # Generate export.pdb so Rekordbox desktop / CDJs can read the USB
-        try:
-            from write_pdb import read_export_db, build_pdb, backup_pdb
-            pdb_path = usb_path / "PIONEER" / "rekordbox" / "export.pdb"
-            db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
-            if db_path.exists():
-                print("\n🔨 Generating export.pdb ...")
-                pdb_data = read_export_db(db_path)
-                # Fill in missing file sizes from actual USB audio files
-                contents_dir = usb_path / "Contents"
-                fixed_sizes = 0
-                for t in pdb_data.get("tracks", []):
-                    if not t.get("fileSize"):
-                        fp = t.get("filePath", "")
-                        if fp:
-                            full = usb_path / fp.lstrip("/")
-                            if full.exists():
-                                t["fileSize"] = full.stat().st_size
-                                fixed_sizes += 1
-                if fixed_sizes:
-                    print(f"  📏 Filled {fixed_sizes} file sizes from USB filesystem")
-                pdb_bytes = build_pdb(pdb_data)
-                if args.dry_run:
-                    print(f"  Would write {len(pdb_bytes):,} bytes to {pdb_path}")
-                else:
-                    if pdb_path.exists():
-                        backup_pdb(pdb_path)
-                    pdb_path.write_bytes(pdb_bytes)
-                    print(f"  ✅ Written {len(pdb_bytes):,} bytes ({len(pdb_bytes)//4096} pages)")
-        except Exception as e:
-            print(f"\n⚠️  export.pdb generation failed (USB still usable via exportLibrary.db): {e}")
-
         # Convert exportLibrary.db from djmd format to Device Library Plus format
         # (Rekordbox desktop reads the DLP format, not the djmd format)
+        # NOTE: PDB generation happens AFTER this conversion (needs DLP format)
         db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
         if db_path.exists():
             # In dry-run mode, the DB on disk may still be DLP from a previous export
@@ -1603,6 +1668,23 @@ def main():
                     # Clean up partial output
                     if dlp_path.exists():
                         dlp_path.unlink()
+
+        # Generate export.pdb + exportExt.pdb using Rust PDB writer
+        # (must run AFTER DLP conversion since it reads DLP-format tables)
+        db_path = usb_path / "PIONEER" / "rekordbox" / "exportLibrary.db"
+        pdb_path = usb_path / "PIONEER" / "rekordbox" / "export.pdb"
+        ext_pdb_path = usb_path / "PIONEER" / "rekordbox" / "exportExt.pdb"
+        try:
+            if db_path.exists() and not args.dry_run:
+                print("\n🔨 Generating export.pdb (Rust) ...")
+                _generate_pdb_rust(db_path, pdb_path, usb_path)
+                _generate_ext_pdb(ext_pdb_path)
+            elif args.dry_run:
+                print("\n🔨 Would generate export.pdb + exportExt.pdb")
+        except Exception as e:
+            print(f"\n⚠️  export.pdb generation failed (USB still usable via exportLibrary.db): {e}")
+            import traceback
+            traceback.print_exc()
 
         print("\n✅ Export completed successfully")
 

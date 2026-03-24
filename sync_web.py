@@ -17,6 +17,9 @@ import sys
 import json
 import subprocess
 import re
+import threading
+import signal
+import time
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -29,6 +32,10 @@ SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff4360849
 EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
 MASTER_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
 SYNC_CONFIG = TOOLS_DIR / "sync_config.json"
+
+# Progress tracking for active syncs
+ACTIVE_SYNCS = {}
+SYNC_LOCK = threading.Lock()
 
 class SyncHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -86,6 +93,11 @@ class SyncHandler(BaseHTTPRequestHandler):
             usb_path = params.get('usb', [None])[0]
             self.get_usb_playlists(usb_path)
         
+        elif parsed_path.path == '/api/sync-progress':
+            params = parse_qs(parsed_path.query)
+            sync_id = params.get('id', [None])[0]
+            self.get_sync_progress(sync_id)
+        
         else:
             self.send_response(404)
             self.end_headers()
@@ -129,6 +141,14 @@ class SyncHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 result = self.execute_wipe(data)
                 self.send_json(200, result)
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+        elif parsed_path.path == '/api/cancel-sync':
+            try:
+                data = json.loads(body)
+                sync_id = data.get('id')
+                self.cancel_sync(sync_id)
+                self.send_json(200, {"cancelled": True})
             except Exception as e:
                 self.send_json(400, {"error": str(e)})
         else:
@@ -224,43 +244,219 @@ class SyncHandler(BaseHTTPRequestHandler):
         if config.get('fetch_nas'):
             args.append('--fetch-nas')
         
-        # Run
+        # Run with progress tracking
         cmd = [sys.executable, str(SYNC_MASTER)] + args
         print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
         
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            return {
-                "success": result.returncode == 0,
-                "returncode": result.returncode,
-                "stdout": result.stdout[-1000:] if result.stdout else "",  # Last 1KB
-                "stderr": result.stderr[-1000:] if result.stderr else ""
+        # Generate sync ID
+        sync_id = self.headers.get('X-Sync-ID')
+        if not sync_id:
+            sync_id = f"sync_{int(time.time() * 1000)}"
+        
+        # Track in ACTIVE_SYNCS
+        with SYNC_LOCK:
+            ACTIVE_SYNCS[sync_id] = {
+                "running": True,
+                "percent": 0,
+                "label": "Starting sync...",
+                "details": "",
+                "process": None,
+                "cancelled": False,
+                "stdout": "",
+                "stderr": ""
             }
+        
+        def run_sync():
+            try:
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                          universal_newlines=True, bufsize=1)
+                
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['process'] = process
+                
+                # Read output line by line and parse progress
+                stdout_lines = []
+                stderr_lines = []
+                for line in iter(process.stdout.readline, ''):
+                    if not line:
+                        break
+                    stdout_lines.append(line)
+                    
+                    # Parse progress from output (look for lines with "Synced X of Y" pattern)
+                    import re
+                    match = re.search(r'(\d+)/(\d+)', line)
+                    if match:
+                        current = int(match.group(1))
+                        total = int(match.group(2))
+                        percent = (current * 100) // total if total > 0 else 0
+                        with SYNC_LOCK:
+                            if sync_id in ACTIVE_SYNCS:
+                                ACTIVE_SYNCS[sync_id]['percent'] = percent
+                                ACTIVE_SYNCS[sync_id]['details'] = f"{current}/{total} tracks processed"
+                    
+                    # Update label with first meaningful line
+                    if 'Syncing' in line or 'Exporting' in line or 'Writing' in line:
+                        with SYNC_LOCK:
+                            if sync_id in ACTIVE_SYNCS:
+                                ACTIVE_SYNCS[sync_id]['label'] = line.strip()[:50]
+                
+                # Wait for completion
+                process.wait()
+                stderr = process.stderr.read() if process.stderr else ""
+                
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['running'] = False
+                        ACTIVE_SYNCS[sync_id]['stdout'] = ''.join(stdout_lines)[-1000:]
+                        ACTIVE_SYNCS[sync_id]['stderr'] = stderr[-1000:] if stderr else ""
+                        ACTIVE_SYNCS[sync_id]['process'] = None
+                        if process.returncode == 0:
+                            ACTIVE_SYNCS[sync_id]['percent'] = 100
+                
+                return process.returncode == 0, ''.join(stdout_lines), stderr
+            
+            except Exception as e:
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['running'] = False
+                        ACTIVE_SYNCS[sync_id]['stderr'] = str(e)
+                        ACTIVE_SYNCS[sync_id]['process'] = None
+                return False, "", str(e)
+        
+        # Run in thread to allow progress updates
+        def run_async():
+            success, stdout, stderr = run_sync()
+            with SYNC_LOCK:
+                if sync_id in ACTIVE_SYNCS:
+                    ACTIVE_SYNCS[sync_id]['success'] = success
+                    ACTIVE_SYNCS[sync_id]['complete'] = True
+        
+        thread = threading.Thread(target=run_async, daemon=True)
+        thread.start()
+        
+        # Return immediately with sync ID so client can poll progress
+        return {
+            "success": True,
+            "sync_id": sync_id,
+            "message": "Sync started in background. Check progress with /api/sync-progress?id=" + sync_id
+        }
+    
+    def execute_wipe(self, config):
+        """Quick FAT32 format of USB drive (like Disk Utility erase)."""
+        usb_path = config.get('usb_path')
+        if not usb_path:
+            return {"success": False, "error": "No USB path provided"}
+        
+        try:
+            usb_path_obj = Path(usb_path)
+            usb_name = usb_path_obj.name
+            
+            # Get the disk device (e.g., /dev/disk2 from /Volumes/PATRIOT)
+            # First, verify the path exists
+            if not usb_path_obj.exists():
+                return {"success": False, "error": f"USB path does not exist: {usb_path}"}
+            
+            # Find the device for this volume using diskutil
+            disk_info = subprocess.run(
+                ['diskutil', 'info', usb_path],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if disk_info.returncode != 0:
+                return {"success": False, "error": f"Could not get disk info: {disk_info.stderr}"}
+            
+            # Extract device path from diskutil output (e.g., "Device Identifier: disk2")
+            device = None
+            for line in disk_info.stdout.split('\n'):
+                if 'Device Identifier:' in line:
+                    device = '/dev/' + line.split()[-1]
+                    break
+            
+            if not device:
+                return {"success": False, "error": "Could not determine device identifier"}
+            
+            # Unmount the volume
+            print(f"[{datetime.now().isoformat()}] Unmounting {usb_path}...")
+            unmount = subprocess.run(
+                ['diskutil', 'umount', device],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if unmount.returncode != 0:
+                return {"success": False, "error": f"Failed to unmount: {unmount.stderr}"}
+            
+            time.sleep(0.5)
+            
+            # Format as exFAT using diskutil
+            print(f"[{datetime.now().isoformat()}] Formatting {device} as exFAT...")
+            format_cmd = subprocess.run(
+                ['diskutil', 'eraseVolume', 'ExFAT', usb_name, device],
+                capture_output=True, text=True, timeout=60
+            )
+            
+            if format_cmd.returncode != 0:
+                # Try remount before returning error
+                subprocess.run(['diskutil', 'mount', device], capture_output=True)
+                return {"success": False, "error": f"Format failed: {format_cmd.stderr}"}
+            
+            # Remount the newly formatted volume
+            time.sleep(0.5)
+            print(f"[{datetime.now().isoformat()}] Remounting {device}...")
+            mount = subprocess.run(
+                ['diskutil', 'mount', device],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if mount.returncode != 0:
+                return {"success": False, "error": f"Failed to remount: {mount.stderr}"}
+            
+            time.sleep(1)
+            
+            # Verify the mount
+            verify = subprocess.run(
+                ['diskutil', 'info', device],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if verify.returncode == 0:
+                return {
+                    "success": True,
+                    "stdout": f"✅ USB '{usb_name}' formatted as exFAT and remounted successfully",
+                    "stderr": ""
+                }
+            else:
+                return {
+                    "success": True,
+                    "stdout": f"⚠️  USB formatted but remount status unclear. Please check Finder.",
+                    "stderr": verify.stderr[-500:]
+                }
+        
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Timeout (>1 hour)"}
+            return {"success": False, "error": "Operation timed out"}
         except Exception as e:
             return {"success": False, "error": str(e)}
     
-    def execute_wipe(self, config):
-        """Wipe all Rekordbox data from USB."""
-        args = ['--wipe']
-        if config.get('usb_path'):
-            args.extend(['--usb', config['usb_path']])
-        if config.get('dry_run'):
-            args.append('--dry-run')
-        
-        cmd = [sys.executable, str(TOOLS_DIR / "traktor_to_usb.py")] + args
-        print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout[-1000:] if result.stdout else "",
-                "stderr": result.stderr[-1000:] if result.stderr else ""
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    def get_sync_progress(self, sync_id):
+        """Get current progress of a sync operation."""
+        with SYNC_LOCK:
+            if sync_id and sync_id in ACTIVE_SYNCS:
+                info = ACTIVE_SYNCS[sync_id]
+                self.send_json(200, info)
+            else:
+                self.send_json(200, {"running": False})
+    
+    def cancel_sync(self, sync_id):
+        """Cancel a running sync operation."""
+        with SYNC_LOCK:
+            if sync_id and sync_id in ACTIVE_SYNCS:
+                info = ACTIVE_SYNCS[sync_id]
+                if info.get('process'):
+                    try:
+                        info['process'].terminate()
+                        info['cancelled'] = True
+                    except:
+                        pass
     
     def send_json(self, code, data):
         """Send JSON response."""
@@ -420,13 +616,26 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(e), "trace": traceback.format_exc()[-500:]})
 
     def detect_usb(self):
-        """Return list of all connected Pioneer USB drives as dicts with path and name."""
+        """Return list of all connected USB drives (with or without PIONEER dir)."""
         drives = []
         try:
             for vol in sorted(Path("/Volumes").iterdir()):
-                if (vol / "PIONEER").is_dir() or (vol / ".PIONEER").is_dir():
-                    drives.append({"path": str(vol), "name": vol.name})
-        except OSError:
+                # Skip system volumes
+                if vol.name in ('Macintosh HD', 'Recovery'):
+                    continue
+
+                # Check if it's on removable media using diskutil
+                info = subprocess.run(
+                    ['diskutil', 'info', str(vol)],
+                    capture_output=True, text=True, timeout=5
+                )
+
+                if info.returncode == 0:
+                    # Check if drive is removable (not internal)
+                    is_removable = 'Removable Media:' in info.stdout and 'Removable' in info.stdout
+                    if is_removable:
+                        drives.append({"path": str(vol), "name": vol.name})
+        except (OSError, subprocess.TimeoutExpired):
             pass
         return drives
 
@@ -558,7 +767,10 @@ class SyncHandler(BaseHTTPRequestHandler):
                 "total_playlists": total_playlists,
                 "tree": tree
             }
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] _read_usb_dlp failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _read_usb_djmd(self, usb_path, db_path):
@@ -821,6 +1033,16 @@ HTML_TEMPLATE = """
         }
         .btn-secondary:hover { background: #444; }
         
+        .btn-cancel {
+            background: #d32f2f;
+            color: #fff;
+            flex: 0 0 auto !important;
+            padding: 12px 24px;
+            font-size: 14px;
+        }
+        .btn-cancel:hover { background: #f44336; }
+        .btn-cancel:active { transform: translateY(0); }
+        
         .status {
             margin-top: 20px;
             padding: 15px;
@@ -1022,9 +1244,22 @@ HTML_TEMPLATE = """
                 
                 <!-- BUTTONS -->
                 <div class="buttons">
-                    <button class="btn-primary" onclick="startSync()">Sync to USB</button>
+                    <button class="btn-primary" id="sync-btn" onclick="startSync()">Sync to USB</button>
                     <button class="btn-secondary" onclick="resetForm()">Reset</button>
+                    <button class="btn-cancel" id="cancel-btn" onclick="cancelSync()" style="display:none;">⏹ Cancel</button>
                     <button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
+                </div>
+                
+                <!-- PROGRESS BAR -->
+                <div id="progress-container" style="display:none; margin-top:20px;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                        <span id="progress-label" style="font-size:0.9em; color:#888;">Syncing...</span>
+                        <span id="progress-percent" style="font-size:0.9em; color:#00bcd4; font-weight:600;">0%</span>
+                    </div>
+                    <div style="width:100%; height:20px; background:rgba(0,0,0,0.3); border-radius:10px; overflow:hidden;">
+                        <div id="progress-bar" style="height:100%; width:0%; background:linear-gradient(90deg, #00bcd4, #00e5ff); transition:width 0.3s ease;"></div>
+                    </div>
+                    <div id="progress-details" style="font-size:0.85em; color:#888; margin-top:8px; text-align:center;"></div>
                 </div>
                 
                 <!-- STATUS -->
@@ -1586,10 +1821,14 @@ HTML_TEMPLATE = """
                         el.innerHTML = '💾 USB: <strong>' + escapeHtml(allUsbDrives[0].name) + '</strong> (' + escapeHtml(allUsbDrives[0].path) + ')';
                     } else {
                         el.className = 'usb-status usb-connected';
+                        // Preserve current dropdown selection across polls
+                        var prevSel = document.getElementById('usb-drive-select');
+                        var prevVal = prevSel ? prevSel.value : null;
                         var html = '💾 ' + allUsbDrives.length + ' USBs connected — target: ';
                         html += '<select id="usb-drive-select" style="background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.9em;">';
                         allUsbDrives.forEach(function(d) {
-                            html += '<option value="' + escapeHtml(d.path) + '">' + escapeHtml(d.name) + ' (' + escapeHtml(d.path) + ')</option>';
+                            var selected = (prevVal && d.path === prevVal) ? ' selected' : '';
+                            html += '<option value="' + escapeHtml(d.path) + '"' + selected + '>' + escapeHtml(d.name) + ' (' + escapeHtml(d.path) + ')</option>';
                         });
                         html += '</select>';
                         el.innerHTML = html;
@@ -1692,6 +1931,9 @@ HTML_TEMPLATE = """
             .catch(function() {});
         
         // ── SYNC ─────────────────────────────────────────────────────────
+        var currentSyncId = null;
+        var progressUpdateInterval = null;
+        
         function startSync() {
             var selection = document.querySelector('input[name="selection"]:checked').value;
             var syncModeRadio = document.querySelector('input[name="sync-mode"]:checked');
@@ -1719,9 +1961,26 @@ HTML_TEMPLATE = """
                 config.playlists = names;
             }
             
+            // Generate sync ID and show progress UI
+            currentSyncId = 'sync_' + Date.now();
             var status = document.getElementById('status');
+            var progressContainer = document.getElementById('progress-container');
+            var syncBtn = document.getElementById('sync-btn');
+            var cancelBtn = document.getElementById('cancel-btn');
+            
             status.className = 'status loading';
-            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Syncing...';
+            status.innerHTML = '';
+            progressContainer.style.display = 'block';
+            document.getElementById('progress-bar').style.width = '0%';
+            document.getElementById('progress-percent').textContent = '0%';
+            document.getElementById('progress-label').textContent = 'Starting sync...';
+            document.getElementById('progress-details').textContent = '';
+            
+            syncBtn.disabled = true;
+            cancelBtn.style.display = 'block';
+            
+            // Start progress polling
+            startProgressPolling();
             
             fetch('/api/sync', {
                 method: 'POST',
@@ -1730,17 +1989,79 @@ HTML_TEMPLATE = """
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
+                stopProgressPolling();
+                if (progressUpdateInterval) clearInterval(progressUpdateInterval);
+                
+                progressContainer.style.display = 'none';
+                syncBtn.disabled = false;
+                cancelBtn.style.display = 'none';
+                
                 if (data.success) {
                     status.className = 'status success';
                     status.innerHTML = '✅ Sync completed successfully!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
+                    document.getElementById('progress-bar').style.width = '100%';
+                    document.getElementById('progress-percent').textContent = '100%';
                 } else {
                     status.className = 'status error';
                     status.innerHTML = '❌ Sync failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
                 }
             })
             .catch(function(e) {
+                stopProgressPolling();
+                if (progressUpdateInterval) clearInterval(progressUpdateInterval);
+                progressContainer.style.display = 'none';
+                syncBtn.disabled = false;
+                cancelBtn.style.display = 'none';
                 status.className = 'status error';
                 status.innerHTML = '❌ Error: ' + escapeHtml(e.message);
+            });
+        }
+        
+        function startProgressPolling() {
+            // Poll for progress updates every 500ms
+            progressUpdateInterval = setInterval(function() {
+                if (!currentSyncId) return;
+                
+                fetch('/api/sync-progress?id=' + encodeURIComponent(currentSyncId))
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        if (data.running) {
+                            var percent = data.percent || 0;
+                            var details = data.details || '';
+                            document.getElementById('progress-bar').style.width = percent + '%';
+                            document.getElementById('progress-percent').textContent = Math.round(percent) + '%';
+                            document.getElementById('progress-label').textContent = data.label || 'Syncing...';
+                            document.getElementById('progress-details').textContent = details;
+                        }
+                    });
+            }, 500);
+        }
+        
+        function stopProgressPolling() {
+            currentSyncId = null;
+            if (progressUpdateInterval) {
+                clearInterval(progressUpdateInterval);
+                progressUpdateInterval = null;
+            }
+        }
+        
+        function cancelSync() {
+            if (!currentSyncId) return;
+            
+            fetch('/api/cancel-sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: currentSyncId })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var status = document.getElementById('status');
+                status.className = 'status error';
+                status.innerHTML = '⏹ Sync cancelled';
+                stopProgressPolling();
+                document.getElementById('progress-container').style.display = 'none';
+                document.getElementById('sync-btn').disabled = false;
+                document.getElementById('cancel-btn').style.display = 'none';
             });
         }
         
@@ -1759,17 +2080,18 @@ HTML_TEMPLATE = """
         }
         
         function wipeUsb() {
-            if (!lastUsbPath) {
+            var targetPath = getSelectedUsbPath();
+            if (!targetPath) {
                 alert('No USB detected. Plug in a Pioneer USB first.');
                 return;
             }
-            var usbName = lastUsbPath.split('/').pop();
-            if (!confirm('⚠️ This will DELETE all Rekordbox data from ' + usbName + ':\\n\\n• Audio files (Contents/)\\n• Database (exportLibrary.db)\\n• Waveforms & cues (USBANLZ/)\\n\\nAre you sure?')) {
+            var usbName = targetPath.split('/').pop();
+            if (!confirm('⚠️ This will FORMAT ' + usbName + ' as exFAT\\n\\nAll data will be erased. The USB will be ready for a fresh export.\\n\\nAre you sure?')) {
                 return;
             }
             var status = document.getElementById('status');
             status.className = 'status loading';
-            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Wiping USB...';
+            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Formatting USB...';
             
             fetch('/api/wipe-usb', {
                 method: 'POST',
@@ -1780,10 +2102,10 @@ HTML_TEMPLATE = """
             .then(function(data) {
                 if (data.success) {
                     status.className = 'status success';
-                    status.innerHTML = '✅ USB wiped!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
+                    status.innerHTML = '✅ USB formatted and ready!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
                 } else {
                     status.className = 'status error';
-                    status.innerHTML = '❌ Wipe failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
+                    status.innerHTML = '❌ Format failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
                 }
             })
             .catch(function(e) {
@@ -2263,3 +2585,14 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ============= PROGRESS TRACKING & CANCEL SUPPORT (added after existing code) =============
+# This global dict tracks current sync processes for progress/cancel
+ACTIVE_SYNCS = {}
+SYNC_ID_COUNTER = 0
+
+def get_next_sync_id():
+    global SYNC_ID_COUNTER
+    SYNC_ID_COUNTER += 1
+    return SYNC_ID_COUNTER
+
