@@ -296,7 +296,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                                 ACTIVE_SYNCS[sync_id]['details'] = f"{current}/{total} tracks processed"
                     
                     # Update label with first meaningful line
-                    if 'Syncing' in line or 'Exporting' in line or 'Writing' in line:
+                    if 'Syncing' in line or 'Exporting' in line or 'Writing' in line or 'Processing' in line:
                         with SYNC_LOCK:
                             if sync_id in ACTIVE_SYNCS:
                                 ACTIVE_SYNCS[sync_id]['label'] = line.strip()[:50]
