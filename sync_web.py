@@ -1989,22 +1989,20 @@ HTML_TEMPLATE = """
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
-                stopProgressPolling();
-                if (progressUpdateInterval) clearInterval(progressUpdateInterval);
-                
-                progressContainer.style.display = 'none';
-                syncBtn.disabled = false;
-                cancelBtn.style.display = 'none';
-                
-                if (data.success) {
-                    status.className = 'status success';
-                    status.innerHTML = '✅ Sync completed successfully!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
-                    document.getElementById('progress-bar').style.width = '100%';
-                    document.getElementById('progress-percent').textContent = '100%';
-                } else {
+                // Response contains sync_id — sync runs in background
+                // Don't stop polling yet; wait for actual completion
+                if (!data.success && !data.sync_id) {
+                    // Initial request failed
+                    stopProgressPolling();
+                    if (progressUpdateInterval) clearInterval(progressUpdateInterval);
+                    progressContainer.style.display = 'none';
+                    syncBtn.disabled = false;
+                    cancelBtn.style.display = 'none';
                     status.className = 'status error';
                     status.innerHTML = '❌ Sync failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
+                    return;
                 }
+                // Sync started — continue polling for completion
             })
             .catch(function(e) {
                 stopProgressPolling();
@@ -2021,7 +2019,7 @@ HTML_TEMPLATE = """
             // Poll for progress updates every 500ms
             progressUpdateInterval = setInterval(function() {
                 if (!currentSyncId) return;
-                
+
                 fetch('/api/sync-progress?id=' + encodeURIComponent(currentSyncId))
                     .then(function(r) { return r.json(); })
                     .then(function(data) {
@@ -2032,6 +2030,29 @@ HTML_TEMPLATE = """
                             document.getElementById('progress-percent').textContent = Math.round(percent) + '%';
                             document.getElementById('progress-label').textContent = data.label || 'Syncing...';
                             document.getElementById('progress-details').textContent = details;
+                        } else if (data.complete) {
+                            // Sync completed
+                            clearInterval(progressUpdateInterval);
+                            progressUpdateInterval = null;
+                            var status = document.getElementById('status');
+                            var progressContainer = document.getElementById('progress-container');
+                            var syncBtn = document.getElementById('sync-btn');
+                            var cancelBtn = document.getElementById('cancel-btn');
+
+                            progressContainer.style.display = 'none';
+                            syncBtn.disabled = false;
+                            cancelBtn.style.display = 'none';
+
+                            if (data.success) {
+                                status.className = 'status success';
+                                status.innerHTML = '✅ Sync completed successfully!<br><small>' + escapeHtml(data.stdout || '') + '</small>';
+                                document.getElementById('progress-bar').style.width = '100%';
+                                document.getElementById('progress-percent').textContent = '100%';
+                            } else {
+                                status.className = 'status error';
+                                status.innerHTML = '❌ Sync failed:<br><small>' + escapeHtml(data.stderr || '') + '</small>';
+                            }
+                            currentSyncId = null;
                         }
                     });
             }, 500);
