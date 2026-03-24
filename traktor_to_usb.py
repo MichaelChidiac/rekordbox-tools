@@ -776,8 +776,9 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
 
     total = len(tracks)
     for i, (cid, row) in enumerate(tracks.items(), 1):
-        if i % 200 == 0 or i == total:
-            print(f"  [{i}/{total}] Processing tracks…", end='\r')
+        # Print progress for every track (flush for real-time display)
+        if i % max(1, total // 100) == 0 or i == total or i == 1:
+            print(f"  [{i}/{total}] Processing tracks…", flush=True)
 
         (db_id, folder_path, filename, title, bpm, length, ftype,
          bitrate, samplerate, comment, rating, color_id, key_id, track_uuid,
