@@ -212,15 +212,16 @@ class SyncHandler(BaseHTTPRequestHandler):
             return {"success": False, "error": str(e)}
     
     def execute_sync(self, config):
-        """Execute sync command."""
+        """Execute sync command. Supports parallel multi-USB via usb_paths list."""
+        import re
         args = []
-        
+
         # Operation
         if config.get('target') == 'rekordbox':
             args.append('--to-rekordbox')
         elif config.get('target') == 'usb':
             args.append('--to-usb')
-        
+
         # Selection
         if config.get('selection') == 'all':
             args.append('--all')
@@ -230,10 +231,7 @@ class SyncHandler(BaseHTTPRequestHandler):
             args.append('--select')
         else:
             args.append('--all')
-        
-        # USB options
-        if config.get('usb_path'):
-            args.extend(['--usb', config['usb_path']])
+
         # --mode takes precedence over legacy sync_mode
         if config.get('mode') in ('update', 'push', 'mirror'):
             args.extend(['--mode', config['mode']])
@@ -243,101 +241,181 @@ class SyncHandler(BaseHTTPRequestHandler):
             args.append('--dry-run')
         if config.get('fetch_nas'):
             args.append('--fetch-nas')
-        
-        # Run with progress tracking
-        cmd = [sys.executable, str(SYNC_MASTER)] + args
-        print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
-        
+
+        # Collect USB paths — support both usb_paths[] (multi) and usb_path (legacy)
+        usb_paths = config.get('usb_paths') or []
+        if not usb_paths and config.get('usb_path'):
+            usb_paths = [config['usb_path']]
+
         # Generate sync ID
-        sync_id = self.headers.get('X-Sync-ID')
-        if not sync_id:
-            sync_id = f"sync_{int(time.time() * 1000)}"
-        
-        # Track in ACTIVE_SYNCS
+        sync_id = f"sync_{int(time.time() * 1000)}"
+
+        # Build per-drive initial state
+        sub_syncs = {
+            p: {"running": True, "percent": 0, "label": "Starting...", "details": "", "process": None}
+            for p in usb_paths
+        } if usb_paths else {}
+
         with SYNC_LOCK:
             ACTIVE_SYNCS[sync_id] = {
                 "running": True,
                 "percent": 0,
                 "label": "Starting sync...",
                 "details": "",
-                "process": None,
                 "cancelled": False,
                 "stdout": "",
-                "stderr": ""
+                "stderr": "",
+                "sub_syncs": sub_syncs
             }
-        
-        def run_sync():
+
+        def run_one_usb(usb_path):
+            """Run sync subprocess for a single USB path, updating sub_syncs live."""
+            usb_cmd = [sys.executable, str(SYNC_MASTER)] + args + ['--usb', usb_path]
+            print(f"[{datetime.now().isoformat()}] Running ({usb_path}): {' '.join(usb_cmd)}")
             try:
                 env = os.environ.copy()
                 env['PYTHONUNBUFFERED'] = '1'
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          universal_newlines=True, bufsize=1, env=env)
-
+                process = subprocess.Popen(usb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           universal_newlines=True, bufsize=1, env=env)
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
-                        ACTIVE_SYNCS[sync_id]['process'] = process
+                        ACTIVE_SYNCS[sync_id]['sub_syncs'][usb_path]['process'] = process
 
-                # Read output line by line and parse progress
                 stdout_lines = []
-                stderr_lines = []
                 for line in iter(process.stdout.readline, ''):
                     if not line:
                         break
                     stdout_lines.append(line)
 
-                    # Parse progress from output (look for lines with "Synced X of Y" pattern)
-                    import re
                     match = re.search(r'(\d+)/(\d+)', line)
                     if match:
                         current = int(match.group(1))
                         total = int(match.group(2))
-                        percent = (current * 100) // total if total > 0 else 0
+                        pct = (current * 100) // total if total > 0 else 0
                         with SYNC_LOCK:
                             if sync_id in ACTIVE_SYNCS:
-                                ACTIVE_SYNCS[sync_id]['percent'] = percent
-                                ACTIVE_SYNCS[sync_id]['details'] = f"{current}/{total} tracks processed"
+                                sub = ACTIVE_SYNCS[sync_id]['sub_syncs'][usb_path]
+                                sub['percent'] = pct
+                                sub['details'] = f"{current}/{total} tracks"
+                                all_pcts = [s['percent'] for s in ACTIVE_SYNCS[sync_id]['sub_syncs'].values()]
+                                ACTIVE_SYNCS[sync_id]['percent'] = sum(all_pcts) // len(all_pcts)
 
-                    # Update label with first meaningful line
                     if 'Syncing' in line or 'Exporting' in line or 'Writing' in line or 'Processing' in line:
                         with SYNC_LOCK:
                             if sync_id in ACTIVE_SYNCS:
-                                ACTIVE_SYNCS[sync_id]['label'] = line.strip()[:50]
-                
-                # Wait for completion
+                                ACTIVE_SYNCS[sync_id]['sub_syncs'][usb_path]['label'] = line.strip()[:60]
+                                ACTIVE_SYNCS[sync_id]['label'] = line.strip()[:60]
+
                 process.wait()
                 stderr = process.stderr.read() if process.stderr else ""
-                
+
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        sub = ACTIVE_SYNCS[sync_id]['sub_syncs'][usb_path]
+                        sub['running'] = False
+                        sub['process'] = None
+                        sub['complete'] = True
+                        sub['success'] = (process.returncode == 0)
+                        sub['stdout'] = ''.join(stdout_lines)[-500:]
+                        sub['stderr'] = stderr[-500:] if stderr else ""
+                        if process.returncode == 0:
+                            sub['percent'] = 100
+                        all_pcts = [s['percent'] for s in ACTIVE_SYNCS[sync_id]['sub_syncs'].values()]
+                        ACTIVE_SYNCS[sync_id]['percent'] = sum(all_pcts) // len(all_pcts)
+                        all_done = all(not s.get('running', True) for s in ACTIVE_SYNCS[sync_id]['sub_syncs'].values())
+                        if all_done or not ACTIVE_SYNCS[sync_id]['sub_syncs']:
+                            ACTIVE_SYNCS[sync_id]['running'] = False
+                            ACTIVE_SYNCS[sync_id]['complete'] = True
+                            ACTIVE_SYNCS[sync_id]['success'] = all(
+                                s.get('success', False) for s in ACTIVE_SYNCS[sync_id]['sub_syncs'].values()
+                            )
+                            ACTIVE_SYNCS[sync_id]['stdout'] = ''.join(stdout_lines)[-1000:]
+                            ACTIVE_SYNCS[sync_id]['stderr'] = stderr[-1000:] if stderr else ""
+
+                return process.returncode == 0
+
+            except Exception as e:
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        sub = ACTIVE_SYNCS[sync_id]['sub_syncs'][usb_path]
+                        sub['running'] = False
+                        sub['process'] = None
+                        sub['complete'] = True
+                        sub['success'] = False
+                        sub['stderr'] = str(e)
+                        all_done = all(not s.get('running', True) for s in ACTIVE_SYNCS[sync_id]['sub_syncs'].values())
+                        if all_done:
+                            ACTIVE_SYNCS[sync_id]['running'] = False
+                            ACTIVE_SYNCS[sync_id]['complete'] = True
+                            ACTIVE_SYNCS[sync_id]['success'] = False
+                return False
+
+        def run_no_usb():
+            """Run sync without --usb flag (e.g. --to-rekordbox)."""
+            cmd = [sys.executable, str(SYNC_MASTER)] + args
+            print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
+            try:
+                env = os.environ.copy()
+                env['PYTHONUNBUFFERED'] = '1'
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           universal_newlines=True, bufsize=1, env=env)
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['process'] = process
+
+                stdout_lines = []
+                for line in iter(process.stdout.readline, ''):
+                    if not line:
+                        break
+                    stdout_lines.append(line)
+                    match = re.search(r'(\d+)/(\d+)', line)
+                    if match:
+                        current = int(match.group(1))
+                        total = int(match.group(2))
+                        pct = (current * 100) // total if total > 0 else 0
+                        with SYNC_LOCK:
+                            if sync_id in ACTIVE_SYNCS:
+                                ACTIVE_SYNCS[sync_id]['percent'] = pct
+                                ACTIVE_SYNCS[sync_id]['details'] = f"{current}/{total} tracks processed"
+                    if 'Syncing' in line or 'Exporting' in line or 'Writing' in line or 'Processing' in line:
+                        with SYNC_LOCK:
+                            if sync_id in ACTIVE_SYNCS:
+                                ACTIVE_SYNCS[sync_id]['label'] = line.strip()[:60]
+
+                process.wait()
+                stderr = process.stderr.read() if process.stderr else ""
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
                         ACTIVE_SYNCS[sync_id]['running'] = False
+                        ACTIVE_SYNCS[sync_id]['complete'] = True
+                        ACTIVE_SYNCS[sync_id]['success'] = (process.returncode == 0)
                         ACTIVE_SYNCS[sync_id]['stdout'] = ''.join(stdout_lines)[-1000:]
                         ACTIVE_SYNCS[sync_id]['stderr'] = stderr[-1000:] if stderr else ""
                         ACTIVE_SYNCS[sync_id]['process'] = None
                         if process.returncode == 0:
                             ACTIVE_SYNCS[sync_id]['percent'] = 100
-                
-                return process.returncode == 0, ''.join(stdout_lines), stderr
-            
             except Exception as e:
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
                         ACTIVE_SYNCS[sync_id]['running'] = False
+                        ACTIVE_SYNCS[sync_id]['complete'] = True
+                        ACTIVE_SYNCS[sync_id]['success'] = False
                         ACTIVE_SYNCS[sync_id]['stderr'] = str(e)
                         ACTIVE_SYNCS[sync_id]['process'] = None
-                return False, "", str(e)
-        
-        # Run in thread to allow progress updates
-        def run_async():
-            success, stdout, stderr = run_sync()
-            with SYNC_LOCK:
-                if sync_id in ACTIVE_SYNCS:
-                    ACTIVE_SYNCS[sync_id]['success'] = success
-                    ACTIVE_SYNCS[sync_id]['complete'] = True
 
-        thread = threading.Thread(target=run_async, daemon=True)
-        thread.start()
-        
-        # Return immediately with sync ID so client can poll progress
+        def run_async():
+            if usb_paths:
+                # Spawn one thread per USB, all run in parallel
+                threads = [threading.Thread(target=run_one_usb, args=(p,), daemon=True) for p in usb_paths]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            else:
+                run_no_usb()
+
+        threading.Thread(target=run_async, daemon=True).start()
+
         return {
             "success": True,
             "sync_id": sync_id,
@@ -444,8 +522,13 @@ class SyncHandler(BaseHTTPRequestHandler):
         with SYNC_LOCK:
             if sync_id and sync_id in ACTIVE_SYNCS:
                 raw = ACTIVE_SYNCS[sync_id]
-                # 'process' is a Popen object — not JSON serializable, exclude it
                 info = {k: v for k, v in raw.items() if k != 'process'}
+                # Strip Popen objects from sub_syncs too
+                if 'sub_syncs' in info:
+                    info['sub_syncs'] = {
+                        path: {k: v for k, v in sub.items() if k != 'process'}
+                        for path, sub in info['sub_syncs'].items()
+                    }
             else:
                 info = {"running": False}
 
@@ -456,12 +539,18 @@ class SyncHandler(BaseHTTPRequestHandler):
         with SYNC_LOCK:
             if sync_id and sync_id in ACTIVE_SYNCS:
                 info = ACTIVE_SYNCS[sync_id]
+                info['cancelled'] = True
                 if info.get('process'):
                     try:
                         info['process'].terminate()
-                        info['cancelled'] = True
                     except:
                         pass
+                for sub in info.get('sub_syncs', {}).values():
+                    if sub.get('process'):
+                        try:
+                            sub['process'].terminate()
+                        except:
+                            pass
     
     def send_json(self, code, data):
         """Send JSON response."""
@@ -1252,7 +1341,7 @@ HTML_TEMPLATE = """
                     <button class="btn-primary" id="sync-btn" onclick="startSync()">Sync to USB</button>
                     <button class="btn-secondary" onclick="resetForm()">Reset</button>
                     <button class="btn-cancel" id="cancel-btn" onclick="cancelSync()" style="display:none;">⏹ Cancel</button>
-                    <button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
+                    <span id="wipe-drive-wrap"></span><button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
                 </div>
                 
                 <!-- PROGRESS BAR -->
@@ -1801,46 +1890,83 @@ HTML_TEMPLATE = """
         }
         
         // ── USB STATUS ───────────────────────────────────────────────────
-        var lastUsbPath = null;
         var allUsbDrives = [];
-        
-        function getSelectedUsbPath() {
-            var sel = document.getElementById('usb-drive-select');
-            return sel ? sel.value : lastUsbPath;
+        // Set of paths currently checked for sync (persists across polls)
+        var selectedUsbPaths = new Set();
+
+        function getSelectedUsbPaths() {
+            // Return checked paths; if none explicitly chosen, default to all connected drives
+            var checked = [];
+            allUsbDrives.forEach(function(d) {
+                var cb = document.getElementById('usb-cb-' + CSS.escape(d.path));
+                if (cb && cb.checked) checked.push(d.path);
+            });
+            if (checked.length === 0 && allUsbDrives.length === 1) {
+                return [allUsbDrives[0].path];
+            }
+            return checked;
         }
-        
+
+        function getWipeTargetPath() {
+            var sel = document.getElementById('wipe-drive-select');
+            if (sel) return sel.value;
+            return allUsbDrives.length > 0 ? allUsbDrives[0].path : null;
+        }
+
         var prevUsbConnected = false;
-        
+
         function checkUsbStatus() {
             fetch('/api/usb-status')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     allUsbDrives = data.drives || [];
-                    lastUsbPath = data.connected ? data.path : null;
                     var el = document.getElementById('usb-status');
+
                     if (!data.connected) {
                         el.className = 'usb-status usb-disconnected';
                         el.innerHTML = '💾 No Pioneer USB detected';
+                        selectedUsbPaths.clear();
                     } else if (allUsbDrives.length === 1) {
                         el.className = 'usb-status usb-connected';
                         el.innerHTML = '💾 USB: <strong>' + escapeHtml(allUsbDrives[0].name) + '</strong> (' + escapeHtml(allUsbDrives[0].path) + ')';
+                        selectedUsbPaths = new Set([allUsbDrives[0].path]);
                     } else {
                         el.className = 'usb-status usb-connected';
-                        // Preserve current dropdown selection across polls
-                        var prevSel = document.getElementById('usb-drive-select');
-                        var prevVal = prevSel ? prevSel.value : null;
-                        var html = '💾 ' + allUsbDrives.length + ' USBs connected — target: ';
-                        html += '<select id="usb-drive-select" style="background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.9em;">';
+                        // Preserve checkbox state across polls
+                        var html = '💾 ' + allUsbDrives.length + ' USBs — sync targets:<br>';
                         allUsbDrives.forEach(function(d) {
-                            var selected = (prevVal && d.path === prevVal) ? ' selected' : '';
-                            html += '<option value="' + escapeHtml(d.path) + '"' + selected + '>' + escapeHtml(d.name) + ' (' + escapeHtml(d.path) + ')</option>';
+                            var isChecked = selectedUsbPaths.has(d.path) || selectedUsbPaths.size === 0;
+                            if (isChecked) selectedUsbPaths.add(d.path);
+                            var cbId = 'usb-cb-' + d.path.replace(/[^a-zA-Z0-9]/g, '_');
+                            html += '<label style="display:inline-flex;align-items:center;gap:5px;margin:3px 10px 3px 0;cursor:pointer;">';
+                            html += '<input type="checkbox" id="' + cbId + '" value="' + escapeHtml(d.path) + '"' + (isChecked ? ' checked' : '') + ' onchange="onUsbCheckChange(this)">';
+                            html += '<strong>' + escapeHtml(d.name) + '</strong> <span style="color:#888;font-size:0.85em;">(' + escapeHtml(d.path) + ')</span>';
+                            html += '</label>';
                         });
-                        html += '</select>';
                         el.innerHTML = html;
                     }
+
+                    // Update wipe drive selector
+                    var wipeWrap = document.getElementById('wipe-drive-wrap');
+                    if (wipeWrap) {
+                        if (allUsbDrives.length > 1) {
+                            var prevWipeSel = document.getElementById('wipe-drive-select');
+                            var prevWipeVal = prevWipeSel ? prevWipeSel.value : null;
+                            var ws = '<select id="wipe-drive-select" style="background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.85em;margin-right:6px;" title="Choose USB to wipe">';
+                            allUsbDrives.forEach(function(d) {
+                                var sel = (prevWipeVal === d.path) ? ' selected' : '';
+                                ws += '<option value="' + escapeHtml(d.path) + '"' + sel + '>' + escapeHtml(d.name) + '</option>';
+                            });
+                            ws += '</select>';
+                            wipeWrap.innerHTML = ws;
+                        } else {
+                            wipeWrap.innerHTML = '';
+                        }
+                    }
+
                     updateUsbAutoSyncButton();
-                    
-                    // Auto-mirror trigger: USB just connected + auto_mirror enabled + pinned playlists exist
+
+                    // Auto-mirror trigger
                     var justConnected = data.connected && !prevUsbConnected;
                     prevUsbConnected = data.connected;
                     if (justConnected && pinnedPlaylists.size > 0) {
@@ -1852,19 +1978,26 @@ HTML_TEMPLATE = """
                 })
                 .catch(function() {});
         }
+
+        function onUsbCheckChange(cb) {
+            if (cb.checked) {
+                selectedUsbPaths.add(cb.value);
+            } else {
+                selectedUsbPaths.delete(cb.value);
+            }
+        }
         
         function updateUsbAutoSyncButton() {
             var el = document.getElementById('usb-status');
             var existing = document.getElementById('auto-sync-btn');
             if (existing) existing.remove();
-            
-            if (lastUsbPath && pinnedPlaylists.size > 0) {
+
+            if (allUsbDrives.length > 0 && pinnedPlaylists.size > 0) {
                 var btn = document.createElement('button');
                 btn.id = 'auto-sync-btn';
                 btn.className = 'auto-sync-btn';
                 btn.textContent = '⚡ Mirror pinned';
                 btn.addEventListener('click', autoSyncPinned);
-                // append after any select dropdown
                 el.appendChild(btn);
             }
         }
@@ -1886,7 +2019,7 @@ HTML_TEMPLATE = """
                         target: 'usb',
                         selection: 'playlists',
                         playlists: names,
-                        usb_path: getSelectedUsbPath(),
+                        usb_paths: getSelectedUsbPaths(),
                         mode: 'mirror',
                         dry_run: false,
                         fetch_nas: false
@@ -1946,7 +2079,12 @@ HTML_TEMPLATE = """
             var dryRun = document.getElementById('dry-run').checked;
             var fetchNas = document.getElementById('fetch-nas').checked;
             
-            var config = { target: 'usb', selection: selection, mode: mode, dry_run: dryRun, fetch_nas: fetchNas, usb_path: getSelectedUsbPath() };
+            var usbPaths = getSelectedUsbPaths();
+            if (usbPaths.length === 0) {
+                alert('No USB drives selected. Connect a Pioneer USB and check the box next to it.');
+                return;
+            }
+            var config = { target: 'usb', selection: selection, mode: mode, dry_run: dryRun, fetch_nas: fetchNas, usb_paths: usbPaths };
             
             // Mirror mode uses pinned playlists
             if (mode === 'mirror') {
@@ -2025,11 +2163,36 @@ HTML_TEMPLATE = """
                     .then(function(data) {
                         if (data.running) {
                             var percent = data.percent || 0;
-                            var details = data.details || '';
                             document.getElementById('progress-bar').style.width = percent + '%';
                             document.getElementById('progress-percent').textContent = Math.round(percent) + '%';
                             document.getElementById('progress-label').textContent = data.label || 'Syncing...';
-                            document.getElementById('progress-details').textContent = details;
+
+                            var detailsEl = document.getElementById('progress-details');
+                            if (data.sub_syncs && Object.keys(data.sub_syncs).length > 1) {
+                                // Per-drive progress bars
+                                var html = '';
+                                Object.keys(data.sub_syncs).forEach(function(usbPath) {
+                                    var sub = data.sub_syncs[usbPath];
+                                    var driveName = usbPath.split('/').pop();
+                                    var subPct = sub.percent || 0;
+                                    var statusIcon = sub.complete ? (sub.success ? '✅' : '❌') : '⏳';
+                                    html += '<div style="margin-top:8px;">';
+                                    html += '<div style="display:flex;justify-content:space-between;font-size:0.8em;color:#aaa;">';
+                                    html += '<span>' + statusIcon + ' ' + escapeHtml(driveName) + '</span>';
+                                    html += '<span>' + Math.round(subPct) + '%</span>';
+                                    html += '</div>';
+                                    html += '<div style="width:100%;height:6px;background:rgba(0,0,0,0.3);border-radius:3px;overflow:hidden;margin-top:3px;">';
+                                    html += '<div style="height:100%;width:' + subPct + '%;background:linear-gradient(90deg,#00bcd4,#00e5ff);transition:width 0.3s;"></div>';
+                                    html += '</div>';
+                                    if (sub.details) {
+                                        html += '<div style="font-size:0.75em;color:#666;margin-top:1px;">' + escapeHtml(sub.details) + '</div>';
+                                    }
+                                    html += '</div>';
+                                });
+                                detailsEl.innerHTML = html;
+                            } else {
+                                detailsEl.textContent = data.details || '';
+                            }
                         } else if (data.complete) {
                             // Sync completed
                             clearInterval(progressUpdateInterval);
@@ -2101,7 +2264,7 @@ HTML_TEMPLATE = """
         }
         
         function wipeUsb() {
-            var targetPath = getSelectedUsbPath();
+            var targetPath = getWipeTargetPath();
             if (!targetPath) {
                 alert('No USB detected. Plug in a Pioneer USB first.');
                 return;
@@ -2113,11 +2276,11 @@ HTML_TEMPLATE = """
             var status = document.getElementById('status');
             status.className = 'status loading';
             status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>Formatting USB...';
-            
+
             fetch('/api/wipe-usb', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ usb_path: getSelectedUsbPath() })
+                body: JSON.stringify({ usb_path: targetPath })
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
