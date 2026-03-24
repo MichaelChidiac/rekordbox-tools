@@ -213,7 +213,6 @@ class SyncHandler(BaseHTTPRequestHandler):
     
     def execute_sync(self, config):
         """Execute sync command."""
-        print(f"[EXECUTE_SYNC] Called with config: {config}", flush=True)
         args = []
         
         # Operation
@@ -275,7 +274,6 @@ class SyncHandler(BaseHTTPRequestHandler):
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
                         ACTIVE_SYNCS[sync_id]['process'] = process
-                        ACTIVE_SYNCS[sync_id]['label'] = "Reading output…"
 
                 # Read output line by line and parse progress
                 stdout_lines = []
@@ -284,7 +282,6 @@ class SyncHandler(BaseHTTPRequestHandler):
                     if not line:
                         break
                     stdout_lines.append(line)
-                    print(f"[SYNC {sync_id}] {line.rstrip()}", flush=True)
 
                     # Parse progress from output (look for lines with "Synced X of Y" pattern)
                     import re
@@ -329,24 +326,13 @@ class SyncHandler(BaseHTTPRequestHandler):
         
         # Run in thread to allow progress updates
         def run_async():
-            print(f"[THREAD {sync_id}] Starting async sync thread", flush=True)
-            try:
-                success, stdout, stderr = run_sync()
-                print(f"[THREAD {sync_id}] Sync completed with success={success}", flush=True)
-                with SYNC_LOCK:
-                    if sync_id in ACTIVE_SYNCS:
-                        ACTIVE_SYNCS[sync_id]['success'] = success
-                        ACTIVE_SYNCS[sync_id]['complete'] = True
-            except Exception as e:
-                print(f"[THREAD {sync_id}] ERROR: {e}", flush=True)
-                with SYNC_LOCK:
-                    if sync_id in ACTIVE_SYNCS:
-                        ACTIVE_SYNCS[sync_id]['success'] = False
-                        ACTIVE_SYNCS[sync_id]['complete'] = True
-                        ACTIVE_SYNCS[sync_id]['stderr'] = str(e)
+            success, stdout, stderr = run_sync()
+            with SYNC_LOCK:
+                if sync_id in ACTIVE_SYNCS:
+                    ACTIVE_SYNCS[sync_id]['success'] = success
+                    ACTIVE_SYNCS[sync_id]['complete'] = True
 
         thread = threading.Thread(target=run_async, daemon=True)
-        print(f"[SYNC {sync_id}] Spawning async thread for command: {' '.join(cmd[:5])}...", flush=True)
         thread.start()
         
         # Return immediately with sync ID so client can poll progress
@@ -456,9 +442,15 @@ class SyncHandler(BaseHTTPRequestHandler):
         with SYNC_LOCK:
             if sync_id and sync_id in ACTIVE_SYNCS:
                 info = ACTIVE_SYNCS[sync_id]
-                self.send_json(200, info)
             else:
-                self.send_json(200, {"running": False})
+                info = {"running": False}
+
+        # Send response directly
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        response_data = json.dumps(info)
+        self.wfile.write(response_data.encode())
     
     def cancel_sync(self, sync_id):
         """Cancel a running sync operation."""
@@ -477,10 +469,7 @@ class SyncHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
-        json_str = json.dumps(data)
-        json_bytes = json_str.encode()
-        print(f"[SEND_JSON] Sending {len(json_bytes)} bytes: {json_str[:100]}...", flush=True)
-        self.wfile.write(json_bytes)
+        self.wfile.write(json.dumps(data).encode())
     
     def log_message(self, format, *args):
         """Suppress default logs."""
