@@ -213,6 +213,7 @@ class SyncHandler(BaseHTTPRequestHandler):
     
     def execute_sync(self, config):
         """Execute sync command."""
+        print(f"[EXECUTE_SYNC] Called with config: {config}", flush=True)
         args = []
         
         # Operation
@@ -268,13 +269,14 @@ class SyncHandler(BaseHTTPRequestHandler):
         
         def run_sync():
             try:
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                          universal_newlines=True, bufsize=1)
-                
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          universal_newlines=True, bufsize=-1)
+
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
                         ACTIVE_SYNCS[sync_id]['process'] = process
-                
+                        ACTIVE_SYNCS[sync_id]['label'] = "Reading output…"
+
                 # Read output line by line and parse progress
                 stdout_lines = []
                 stderr_lines = []
@@ -282,7 +284,8 @@ class SyncHandler(BaseHTTPRequestHandler):
                     if not line:
                         break
                     stdout_lines.append(line)
-                    
+                    print(f"[SYNC {sync_id}] {line.rstrip()}", flush=True)
+
                     # Parse progress from output (look for lines with "Synced X of Y" pattern)
                     import re
                     match = re.search(r'(\d+)/(\d+)', line)
@@ -294,7 +297,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                             if sync_id in ACTIVE_SYNCS:
                                 ACTIVE_SYNCS[sync_id]['percent'] = percent
                                 ACTIVE_SYNCS[sync_id]['details'] = f"{current}/{total} tracks processed"
-                    
+
                     # Update label with first meaningful line
                     if 'Syncing' in line or 'Exporting' in line or 'Writing' in line or 'Processing' in line:
                         with SYNC_LOCK:
@@ -326,13 +329,24 @@ class SyncHandler(BaseHTTPRequestHandler):
         
         # Run in thread to allow progress updates
         def run_async():
-            success, stdout, stderr = run_sync()
-            with SYNC_LOCK:
-                if sync_id in ACTIVE_SYNCS:
-                    ACTIVE_SYNCS[sync_id]['success'] = success
-                    ACTIVE_SYNCS[sync_id]['complete'] = True
-        
+            print(f"[THREAD {sync_id}] Starting async sync thread", flush=True)
+            try:
+                success, stdout, stderr = run_sync()
+                print(f"[THREAD {sync_id}] Sync completed with success={success}", flush=True)
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['success'] = success
+                        ACTIVE_SYNCS[sync_id]['complete'] = True
+            except Exception as e:
+                print(f"[THREAD {sync_id}] ERROR: {e}", flush=True)
+                with SYNC_LOCK:
+                    if sync_id in ACTIVE_SYNCS:
+                        ACTIVE_SYNCS[sync_id]['success'] = False
+                        ACTIVE_SYNCS[sync_id]['complete'] = True
+                        ACTIVE_SYNCS[sync_id]['stderr'] = str(e)
+
         thread = threading.Thread(target=run_async, daemon=True)
+        print(f"[SYNC {sync_id}] Spawning async thread for command: {' '.join(cmd[:5])}...", flush=True)
         thread.start()
         
         # Return immediately with sync ID so client can poll progress
@@ -463,7 +477,10 @@ class SyncHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        json_str = json.dumps(data)
+        json_bytes = json_str.encode()
+        print(f"[SEND_JSON] Sending {len(json_bytes)} bytes: {json_str[:100]}...", flush=True)
+        self.wfile.write(json_bytes)
     
     def log_message(self, format, *args):
         """Suppress default logs."""
