@@ -268,8 +268,10 @@ class SyncHandler(BaseHTTPRequestHandler):
         
         def run_sync():
             try:
+                env = os.environ.copy()
+                env['PYTHONUNBUFFERED'] = '1'
                 process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          universal_newlines=True, bufsize=-1)
+                                          universal_newlines=True, bufsize=1, env=env)
 
                 with SYNC_LOCK:
                     if sync_id in ACTIVE_SYNCS:
@@ -441,16 +443,13 @@ class SyncHandler(BaseHTTPRequestHandler):
         """Get current progress of a sync operation."""
         with SYNC_LOCK:
             if sync_id and sync_id in ACTIVE_SYNCS:
-                info = ACTIVE_SYNCS[sync_id]
+                raw = ACTIVE_SYNCS[sync_id]
+                # 'process' is a Popen object — not JSON serializable, exclude it
+                info = {k: v for k, v in raw.items() if k != 'process'}
             else:
                 info = {"running": False}
 
-        # Send response directly
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        response_data = json.dumps(info)
-        self.wfile.write(response_data.encode())
+        self.send_json(200, info)
     
     def cancel_sync(self, sync_id):
         """Cancel a running sync operation."""

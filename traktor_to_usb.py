@@ -101,11 +101,8 @@ def ts():
     return now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond//1000:03d} +00:00'
 
 def safe_copy(src, dst):
-    """Copy file to USB, falling back to shutil.copy if copy2 fails (FAT32 chflags)."""
-    try:
-        shutil.copy2(src, dst)
-    except OSError:
-        shutil.copy(src, dst)
+    """Copy file to USB (exFAT/FAT32 don't support xattr, so skip metadata copy)."""
+    shutil.copy(src, dst)
 
 def now_ms():
     return int(time.time() * 1000)
