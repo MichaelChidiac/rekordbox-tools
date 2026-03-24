@@ -1967,8 +1967,8 @@ HTML_TEMPLATE = """
                 config.playlists = names;
             }
             
-            // Generate sync ID and show progress UI
-            currentSyncId = 'sync_' + Date.now();
+            // Show progress UI (sync ID will be set once server responds)
+            currentSyncId = null;
             var status = document.getElementById('status');
             var progressContainer = document.getElementById('progress-container');
             var syncBtn = document.getElementById('sync-btn');
@@ -1984,10 +1984,7 @@ HTML_TEMPLATE = """
             
             syncBtn.disabled = true;
             cancelBtn.style.display = 'block';
-            
-            // Start progress polling
-            startProgressPolling();
-            
+
             fetch('/api/sync', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1995,20 +1992,18 @@ HTML_TEMPLATE = """
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
-                // Response contains sync_id — sync runs in background
-                // Don't stop polling yet; wait for actual completion
-                if (!data.success && !data.sync_id) {
-                    // Initial request failed
-                    stopProgressPolling();
-                    if (progressUpdateInterval) clearInterval(progressUpdateInterval);
+                if (data.sync_id) {
+                    // Got server's sync ID — start polling with the correct ID
+                    currentSyncId = data.sync_id;
+                    startProgressPolling();
+                } else {
+                    // Request failed
                     progressContainer.style.display = 'none';
                     syncBtn.disabled = false;
                     cancelBtn.style.display = 'none';
                     status.className = 'status error';
                     status.innerHTML = '❌ Sync failed:<br><small>' + escapeHtml(data.error || data.stderr || '') + '</small>';
-                    return;
                 }
-                // Sync started — continue polling for completion
             })
             .catch(function(e) {
                 stopProgressPolling();
