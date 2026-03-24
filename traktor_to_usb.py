@@ -88,7 +88,8 @@ def force_checkpoint():
         _checkpoint_callback("Force save (exit)")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MASTER_DB  = Path.home() / "Library/Pioneer/rekordbox/master.db"
+MASTER_DB      = Path.home() / "Library/Pioneer/rekordbox/master.db"
+PIONEER_SHARE  = Path.home() / "Library/Pioneer/rekordbox/share"
 KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
 # Device Library Plus key (exportLibrary.db on USB) — different from master.db key
 EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
@@ -575,7 +576,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
                    c.ColorID, c.KeyID, c.UUID, a.Name, al.Name, c.FileSize,
                    c.GenreID, c.AlbumID, c.LabelID, c.ArtistID, c.RemixerID, c.OrgArtistID,
                    c.ComposerID, c.Lyricist, c.ReleaseYear, c.DiscNo, c.TrackNo,
-                   g.Name, l.Name
+                   g.Name, l.Name, c.ImagePath
             FROM djmdContent c
             LEFT JOIN djmdArtist a ON c.ArtistID = a.ID
             LEFT JOIN djmdAlbum al ON c.AlbumID = al.ID
@@ -764,10 +765,11 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         print(f"  🗑  Removed {len(deleted_ids)} deleted tracks")
 
     # ── Copy audio + ANLZ, insert into DB ─────────────────────────────────────
-    copied_audio = 0
-    skipped_audio = 0
-    copied_anlz  = 0
-    missing_audio = []
+    copied_audio   = 0
+    skipped_audio  = 0
+    copied_anlz    = 0
+    copied_artwork = 0
+    missing_audio  = []
     fetched_from_nas = 0
     nas_fetch_failed = 0
 
@@ -782,7 +784,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
          artist_name, album_name, file_size,
          genre_id, album_id, label_id, master_artist_id, remixer_id, org_artist_id,
          composer_id, lyricist, release_year, disc_no, track_no,
-         genre_name, label_name) = row
+         genre_name, label_name, image_path) = row
 
         # Audio
         artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
@@ -850,6 +852,21 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
                 safe_copy(src, dst_anlz)
                 copied_anlz += 1
 
+        # Artwork — copy all size variants (artwork.jpg, artwork_s.jpg, artwork_m.jpg)
+        usb_image_path = ''
+        if image_path:
+            local_art = PIONEER_SHARE / image_path.lstrip('/')
+            if local_art.exists():
+                art_dir_src = local_art.parent
+                art_dir_dst = usb_path / Path(image_path.lstrip('/')).parent
+                art_dir_dst.mkdir(parents=True, exist_ok=True)
+                for art_file in art_dir_src.glob('artwork*.jpg'):
+                    dst_art = art_dir_dst / art_file.name
+                    if not dst_art.exists():
+                        safe_copy(art_file, dst_art)
+                        copied_artwork += 1
+                usb_image_path = image_path  # keep the same relative path on USB
+
         # DB: content — full Rekordbox 6 schema
         artist_id = get_or_insert_artist(artist_name)
         file_name_s = Path(filename).stem if filename else ''
@@ -878,7 +895,7 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
              title or filename, artist_id, str(album_id) if album_id else '', str(genre_id) if genre_id else '',
              bpm, length, track_no or 0, bitrate, 0, comment, ftype, rating or 0,
              release_year or 0, str(remixer_id) if remixer_id else '', str(label_id) if label_id else '', str(org_artist_id) if org_artist_id else '', key_id, '', color_id,
-             0, '', usb_db_id, str(db_id), anlz_data_path or '',
+             0, usb_image_path, usb_db_id, str(db_id), anlz_data_path or '',
              search_str, file_size or 0, disc_no or 0, str(composer_id) if composer_id else '', '', samplerate,
              0, 1, '', ts(), 0, '',
              '', '', '', '', '', '', '', lyricist or '', '',
@@ -918,7 +935,8 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
     print(f"  ✅ Audio:  {copied_audio} local, {skipped_audio} already present, {len(missing_audio)} missing")
     if fetch_nas:
         print(f"  🌐 NAS:   {fetched_from_nas} fetched, {nas_fetch_failed} failed")
-    print(f"  ✅ ANLZ:   {copied_anlz} new files")
+    print(f"  ✅ ANLZ:     {copied_anlz} new files")
+    print(f"  🎨 Artwork: {copied_artwork} new files")
 
     # ── Rebuild playlist structure ────────────────────────────────────────────
     if mode == 'push':
