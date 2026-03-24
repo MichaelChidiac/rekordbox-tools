@@ -1276,7 +1276,7 @@ HTML_TEMPLATE = """
                 <div id="usb-status" class="usb-status usb-disconnected">
                     💾 Checking USB...
                 </div>
-                
+
                 <!-- SELECTION -->
                 <div class="section">
                     <div class="section-title">📋 What to sync?</div>
@@ -1459,7 +1459,7 @@ HTML_TEMPLATE = """
                     <span id="usb-summary-text" style="color:#888; font-size:0.9em;"></span>
                 </div>
 
-                <div id="usb-browser-tree" style="display:none; max-height:600px; overflow-y:auto; padding:8px; border:1px solid #333; border-radius:8px; background:#1a1a1a;">
+                <div id="usb-browser-tree" style="display:none; max-height:600px; overflow-y:auto; overflow-x:hidden; padding:8px; border:1px solid #333; border-radius:8px; background:#1a1a1a;">
                     <div style="text-align:center; color:#888;">Loading...</div>
                 </div>
 
@@ -1891,20 +1891,18 @@ HTML_TEMPLATE = """
         
         // ── USB STATUS ───────────────────────────────────────────────────
         var allUsbDrives = [];
-        // Set of paths currently checked for sync (persists across polls)
-        var selectedUsbPaths = new Set();
+
+        function getSelectedUsbPath() {
+            var sel = document.getElementById('usb-drive-select');
+            return sel ? sel.value : (allUsbDrives.length > 0 ? allUsbDrives[0].path : null);
+        }
 
         function getSelectedUsbPaths() {
-            // Return checked paths; if none explicitly chosen, default to all connected drives
-            var checked = [];
-            allUsbDrives.forEach(function(d) {
-                var cb = document.getElementById('usb-cb-' + CSS.escape(d.path));
-                if (cb && cb.checked) checked.push(d.path);
-            });
-            if (checked.length === 0 && allUsbDrives.length === 1) {
-                return [allUsbDrives[0].path];
-            }
-            return checked;
+            var primary = getSelectedUsbPath();
+            if (!primary) return [];
+            var mirrorSel = document.getElementById('usb-mirror-select');
+            var mirror = mirrorSel ? mirrorSel.value : '';
+            return mirror ? [primary, mirror] : [primary];
         }
 
         function getWipeTargetPath() {
@@ -1925,25 +1923,42 @@ HTML_TEMPLATE = """
                     if (!data.connected) {
                         el.className = 'usb-status usb-disconnected';
                         el.innerHTML = '💾 No Pioneer USB detected';
-                        selectedUsbPaths.clear();
                     } else if (allUsbDrives.length === 1) {
                         el.className = 'usb-status usb-connected';
                         el.innerHTML = '💾 USB: <strong>' + escapeHtml(allUsbDrives[0].name) + '</strong> (' + escapeHtml(allUsbDrives[0].path) + ')';
-                        selectedUsbPaths = new Set([allUsbDrives[0].path]);
                     } else {
                         el.className = 'usb-status usb-connected';
-                        // Preserve checkbox state across polls
-                        var html = '💾 ' + allUsbDrives.length + ' USBs — sync targets:<br>';
+
+                        var prevPrimary = getSelectedUsbPath();
+                        var prevMirrorSel = document.getElementById('usb-mirror-select');
+                        var prevMirror = prevMirrorSel ? prevMirrorSel.value : '';
+
+                        var selStyle = 'background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.9em;';
+
+                        // Primary target dropdown
+                        var html = '💾 Target: <select id="usb-drive-select" style="' + selStyle + '">';
                         allUsbDrives.forEach(function(d) {
-                            var isChecked = selectedUsbPaths.has(d.path) || selectedUsbPaths.size === 0;
-                            if (isChecked) selectedUsbPaths.add(d.path);
-                            var cbId = 'usb-cb-' + d.path.replace(/[^a-zA-Z0-9]/g, '_');
-                            html += '<label style="display:inline-flex;align-items:center;gap:5px;margin:3px 10px 3px 0;cursor:pointer;">';
-                            html += '<input type="checkbox" id="' + cbId + '" value="' + escapeHtml(d.path) + '"' + (isChecked ? ' checked' : '') + ' onchange="onUsbCheckChange(this)">';
-                            html += '<strong>' + escapeHtml(d.name) + '</strong> <span style="color:#888;font-size:0.85em;">(' + escapeHtml(d.path) + ')</span>';
-                            html += '</label>';
+                            var sel = (prevPrimary === d.path) ? ' selected' : '';
+                            html += '<option value="' + escapeHtml(d.path) + '"' + sel + '>' + escapeHtml(d.name) + '</option>';
                         });
+                        html += '</select>';
+
+                        // Mirror dropdown — options are "None" + all drives except the primary
+                        html += ' &nbsp; mirror to: <select id="usb-mirror-select" style="' + selStyle + '" onchange="onMirrorChange()">';
+                        html += '<option value="">None</option>';
+                        allUsbDrives.forEach(function(d) {
+                            var sel = (prevMirror === d.path) ? ' selected' : '';
+                            html += '<option value="' + escapeHtml(d.path) + '"' + sel + '>' + escapeHtml(d.name) + '</option>';
+                        });
+                        html += '</select>';
+
                         el.innerHTML = html;
+
+                        // When primary changes, remove it from mirror options
+                        document.getElementById('usb-drive-select').onchange = function() {
+                            rebuildMirrorOptions();
+                        };
+                        rebuildMirrorOptions();
                     }
 
                     // Update wipe drive selector
@@ -1966,33 +1981,37 @@ HTML_TEMPLATE = """
 
                     updateUsbAutoSyncButton();
 
-                    // Auto-mirror trigger
                     var justConnected = data.connected && !prevUsbConnected;
                     prevUsbConnected = data.connected;
                     if (justConnected && pinnedPlaylists.size > 0) {
                         var cb = document.getElementById('auto-mirror-toggle');
-                        if (cb && cb.checked) {
-                            triggerAutoMirror();
-                        }
+                        if (cb && cb.checked) { triggerAutoMirror(); }
                     }
                 })
                 .catch(function() {});
         }
 
-        function onUsbCheckChange(cb) {
-            if (cb.checked) {
-                selectedUsbPaths.add(cb.value);
-            } else {
-                selectedUsbPaths.delete(cb.value);
-            }
+        function rebuildMirrorOptions() {
+            var mirrorSel = document.getElementById('usb-mirror-select');
+            if (!mirrorSel) return;
+            var primaryPath = getSelectedUsbPath();
+            var currentMirror = mirrorSel.value;
+            mirrorSel.innerHTML = '<option value="">None</option>';
+            allUsbDrives.forEach(function(d) {
+                if (d.path === primaryPath) return; // can't mirror to itself
+                var sel = (currentMirror === d.path) ? ' selected' : '';
+                mirrorSel.innerHTML += '<option value="' + escapeHtml(d.path) + '"' + sel + '>' + escapeHtml(d.name) + '</option>';
+            });
         }
+
+        function onMirrorChange() { /* hook for future use */ }
         
         function updateUsbAutoSyncButton() {
             var el = document.getElementById('usb-status');
             var existing = document.getElementById('auto-sync-btn');
             if (existing) existing.remove();
 
-            if (allUsbDrives.length > 0 && pinnedPlaylists.size > 0) {
+            if (getSelectedUsbPath() && pinnedPlaylists.size > 0) {
                 var btn = document.createElement('button');
                 btn.id = 'auto-sync-btn';
                 btn.className = 'auto-sync-btn';
@@ -2722,17 +2741,19 @@ HTML_TEMPLATE = """
                         trackListDiv.style.display = open ? 'none' : 'block';
                         if (!tracksLoaded && node.tracks && node.tracks.length > 0) {
                             tracksLoaded = true;
-                            var table = '<table style="width:100%; font-size:0.8em; margin:4px 0 8px ' + ((depth+1)*20) + 'px; color:#aaa; border-collapse:collapse;">';
-                            table += '<tr style="color:#666; border-bottom:1px solid #333;"><th style="text-align:left; padding:2px 8px;">#</th><th style="text-align:left; padding:2px 8px;">Title</th><th style="text-align:left; padding:2px 8px;">Artist</th><th style="text-align:right; padding:2px 8px;">BPM</th><th style="text-align:right; padding:2px 8px;">Duration</th></tr>';
+                            var table = '<table style="width:100%; table-layout:fixed; font-size:0.8em; margin:4px 0 8px 0; color:#aaa; border-collapse:collapse;">';
+                            table += '<colgroup><col style="width:28px"><col><col style="width:35%"><col style="width:44px"><col style="width:44px"></colgroup>';
+                            table += '<tr style="color:#666; border-bottom:1px solid #333;"><th style="text-align:left; padding:2px 6px;">#</th><th style="text-align:left; padding:2px 6px;">Title</th><th style="text-align:left; padding:2px 6px;">Artist</th><th style="text-align:right; padding:2px 6px;">BPM</th><th style="text-align:right; padding:2px 6px;">Dur</th></tr>';
                             node.tracks.forEach(function(t, i) {
                                 var mins = Math.floor(t.duration / 60);
                                 var secs = ('0' + (t.duration % 60)).slice(-2);
+                                var trunc = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
                                 table += '<tr style="border-bottom:1px solid #222;">';
-                                table += '<td style="padding:2px 8px; color:#555;">' + (i+1) + '</td>';
-                                table += '<td style="padding:2px 8px;">' + escapeHtml(t.title) + '</td>';
-                                table += '<td style="padding:2px 8px; color:#999;">' + escapeHtml(t.artist) + '</td>';
-                                table += '<td style="padding:2px 8px; text-align:right;">' + (t.bpm || '-') + '</td>';
-                                table += '<td style="padding:2px 8px; text-align:right;">' + mins + ':' + secs + '</td>';
+                                table += '<td style="padding:2px 6px; color:#555;">' + (i+1) + '</td>';
+                                table += '<td style="padding:2px 6px;' + trunc + '">' + escapeHtml(t.title) + '</td>';
+                                table += '<td style="padding:2px 6px; color:#999;' + trunc + '">' + escapeHtml(t.artist) + '</td>';
+                                table += '<td style="padding:2px 6px; text-align:right;">' + (t.bpm || '-') + '</td>';
+                                table += '<td style="padding:2px 6px; text-align:right;">' + mins + ':' + secs + '</td>';
                                 table += '</tr>';
                             });
                             table += '</table>';
