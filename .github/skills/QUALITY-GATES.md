@@ -1,81 +1,108 @@
-# QUALITY-GATES.md — rekordbox-tools
+# QUALITY-GATES.md
 
 ## Automated Code Quality Checkpoints
 
-**Purpose:** Define minimum quality standards checked before any script change is committed. Prevents regressions and maintains safety discipline (backup patterns, SQLCipher correctness, dry-run coverage).
+**Purpose:** Define minimum quality standards that are automatically checked before merge/deployment. Prevents regressions and maintains code health across all parallel agent tasks.
 
-**Applies to:** Both Claude Code and Copilot Coding Agent — gates enforced by task-orchestrator at phase completion.
+**Applies to:** Both Claude Code and Copilot Coding Agent — gates enforced by task-orchestrator regardless of which agent executes
+
+**Status:** Invoked automatically by task-orchestrator at Phase completion + manual pre-merge checks.
 
 ---
 
 ## Quality Gate Framework
 
-Quality gates are **progressive checkpoints** — each phase has minimum standards.
+Quality gates are **progressive checkpoints** — each phase has minimum standards:
 
-### Phase 1 Gates (Schema + Script Implementation)
+### Phase 1 Gates (Migration + Backend Services)
 
 | Gate | Standard | Check Method | Fail Action |
 |------|----------|--------------|-------------|
-| **Syntax Valid** | All modified scripts parse without error | `python3.11 -m py_compile` | Block merge |
-| **PRAGMA Completeness** | All SQLCipher connections have 3 PRAGMAs including legacy=4 | grep check | Block merge |
-| **Dry-Run Present** | All write scripts support `--dry-run` | grep argparse | Block merge |
-| **Backup Pattern** | All master.db write paths call `backup_master_db()` | grep check | Block merge |
-| **No Hardcoded Key** | SQLCIPHER_KEY defined as module constant, not inline | grep check | Block merge |
+| **Schema Valid** | Migrations run without error | Upgrade + downgrade test | Block merge |
+| **Single Head** | No migration conflicts | Check migration heads | Block merge |
+| **Type Safety** | Type checker strict mode | Type check services + models | Warn, document |
+| **Model Integrity** | All foreign keys valid | Run model tests | Block merge |
+| **Service Tests** | Service layer 85%+ coverage | Coverage report on services | Block merge |
 
-**Phase 1 check commands:**
+<!-- CUSTOMIZE: Replace commands below with your project's equivalents -->
+
+**Task:** Before any Phase 1 agent commits
 ```bash
-# Syntax check all Python scripts
-python3.11 -m py_compile traktor_to_rekordbox.py rebuild_rekordbox_playlists.py \
-  cleanup_rekordbox_db.py traktor_to_usb.py sync_master.py pdb_to_traktor.py find_duplicates.py
+# Check migrations
+[MIGRATION_COMMAND] heads
+[MIGRATION_COMMAND] upgrade test_db
+[MIGRATION_COMMAND] downgrade test_db
 
-# Check PRAGMA completeness (every PRAGMA key must have PRAGMA legacy=4 nearby)
-grep -n "PRAGMA key" *.py
-grep -n "PRAGMA legacy" *.py
+# Type check services
+[TYPE_CHECKER] [services directory]/ [models directory]/ --strict
 
-# Check for hardcoded key outside SQLCIPHER_KEY assignment
-grep -n "402fd482" *.py | grep -v "SQLCIPHER_KEY ="
-
-# Check --dry-run in all write scripts
-grep -rn "dry.run\|dry_run" *.py | grep "argparse\|add_argument"
-
-# Check backup calls
-grep -n "readonly=False\|READWRITE" *.py  # then verify backup_master_db nearby
+# Test models + services
+[TEST_COMMAND] tests/test_models.py tests/test_services/ -q --tb=short
 ```
 
-**Example failure:**
+**Example Failure:**
 ```
-❌ PHASE 1 GATE FAILURE: Missing PRAGMA legacy=4
+❌ PHASE 1 GATE FAILURE: Multiple Migration Heads
 
-File: cleanup_rekordbox_db.py (line 47)
-  con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
-  con.execute("PRAGMA cipher='sqlcipher'")
-  # Missing PRAGMA legacy=4 → will fail with "file is not a database"
+Error: 2 migration heads detected
+- feature_branch_migration (from backend agent)
+- other_migration (from migration agent)
 
-Action: Add con.execute("PRAGMA legacy=4") after PRAGMA cipher line.
-Blocking merge until fixed.
+Action: Merge migration heads before commit
+
+Blocking merge until resolved.
 ```
 
 ---
 
-### Phase 2 Gates (Tests + Pattern Enforcement)
+### Phase 2 Gates (Frontend + Tests + Mobile API)
 
 | Gate | Standard | Check Method | Fail Action |
 |------|----------|--------------|-------------|
-| **Tests Pass** | All existing tests pass (if test suite exists) | `python3.11 -m pytest tests/ -x` | Block merge |
-| **No Real Library Files** | `tests/fixtures/` contains only synthetic files | Manual check | Block merge |
-| **Fixtures Centralized** | No fixtures defined in test files | grep check | Warn |
-| **No Production Path Writes** | Tests don't write to `~/Library/Pioneer/` | grep check | Block merge |
+| **Route Docstrings** | 100% of new routes have docstrings | Script or grep check | Warn |
+| **Template Syntax** | Templates valid, no undefined vars | Template test suite | Warn |
+| **JavaScript Lint** | Linter clean (no errors) | JS linter with auto-fix | Warn + auto-fix |
+| **API Response Format** | All responses use standard helpers | Grep for raw response calls | Warn |
+| **Test Coverage** | Overall 70%+, new code 85%+ | Coverage report | Block if under 70% |
+| **E2E Tests** | Critical paths pass (no flakes) | E2E test suite | Warn (log flaky tests) |
+| **Security** | CSRF/auth on state-changing endpoints | Grep + manual review | Warn |
 
-**Phase 2 check commands:**
+<!-- CUSTOMIZE: Replace commands below with your project's equivalents -->
+
+**Task:** Before Phase 2 agents commit
 ```bash
-# Run tests (if they exist)
-python3.11 -m pytest tests/ -x --tb=short -q 2>/dev/null || echo "No tests yet — skipping"
+# Type check
+[TYPE_CHECKER] [source directory]/ --strict --ignore-missing-imports
 
-# Check no real library paths in tests
-grep -rn "Library/Pioneer\|Documents/Native Instruments" tests/ || echo "✅ No real paths"
+# Test coverage (70% minimum)
+[TEST_COMMAND] tests/ --cov=[source directory] --cov-report=term-missing --cov-report=html -q
 
-# Check no fixtures in test files
-grep -rn "@pytest.fixture" tests/test_*.py || echo "✅ All fixtures centralized"
+# Template syntax
+[TEST_COMMAND] tests/test_templates.py -q
+
+# E2E critical paths (optional if flaky)
+[TEST_COMMAND] tests/e2e/critical_paths/ -v --tb=short
+
+# Lint JavaScript (auto-fix)
+[JS_LINTER] static/js/ --fix
+
+# Check docstrings on new routes
+python scripts/check_route_docstrings.py
+```
+
+**Example Failure:**
+```
+❌ PHASE 2 GATE FAILURE: Test Coverage Below Threshold
+
+Current coverage: 68%
+Required: 70%
+Missing coverage:
+  - [routes directory]/dashboard.py: 2 branches uncovered (lines 145, 167)
+  - [services directory]/feature_service.py: 1 function untested
+
+Blocker: Phase 2 cannot merge with < 70% coverage.
+
+Action: test-writer agent must add more test cases to reach 70%+
 ```
 
 ---
@@ -84,117 +111,355 @@ grep -rn "@pytest.fixture" tests/test_*.py || echo "✅ All fixtures centralized
 
 | Gate | Standard | Check Method | Fail Action |
 |------|----------|--------------|-------------|
-| **All Tests Pass** | 100% pass rate | Full test suite | Block merge |
-| **Syntax Clean** | All scripts compile | `py_compile *.py` | Block merge |
-| **Safety Rules** | Dry-run, backup, PRAGMA patterns all intact | grep sweep | Block merge |
-| **No Regressions** | Existing CLI flags still work | `--help` check | Block merge |
-| **SQL Todos Cleaned** | All related SQL todos marked done | Query todos | Warn |
+| **All Tests Pass** | 100% pass rate (no skips except allowed) | Full test suite | Block merge |
+| **No Regressions** | No new failures vs baseline | Compare with main branch | Block merge |
+| **CI Clean** | All CI workflows pass | Check GitHub Actions | Block merge |
+| **Code Review Approved** | At least 1 approval | Check PR reviews | Block merge |
+| **Docs Updated** | API docs regenerated | Run docs command, check diff | Warn |
+| **Feature Registry Updated** | New routes registered | Check feature manifest | Warn |
+| **SQL Todo Cleanup** | All related SQL todos marked 'done' | Query todos table | Warn |
 
-**Pre-merge checklist:**
+**Pre-Merge Checklist:**
 ```bash
-# Full syntax check
-python3.11 -m py_compile *.py
+# Full test suite
+[TEST_COMMAND] tests/ --ignore=tests/e2e -q
 
-# Full test run
-python3.11 -m pytest tests/ -x 2>/dev/null || echo "No tests yet"
+# Regenerate docs
+[DOCS_COMMAND]
 
-# Safety sweep
-grep -rn "PRAGMA key" *.py | wc -l    # count SQLCipher connections
-grep -rn "PRAGMA legacy" *.py | wc -l  # must match above count
+# Verify no unexpected doc changes
+git status docs/
 
-# Verify --help works on all scripts
-for s in traktor_to_rekordbox.py rebuild_rekordbox_playlists.py cleanup_rekordbox_db.py \
-         traktor_to_usb.py sync_master.py pdb_to_traktor.py find_duplicates.py; do
-  python3.11 "$s" --help > /dev/null && echo "✅ $s --help OK" || echo "❌ $s --help FAILED"
-done
+# Check SQL todos
+sqlite3 session.db "SELECT id, status FROM todos WHERE status != 'done'"
 
-# SQL todos
-# sqlite3 session.db "SELECT id, status FROM todos WHERE status != 'done'"
+# Verify single migration head
+[MIGRATION_COMMAND] heads
+
+# Final all-in-one validation
+[BUILD_COMMAND]
 ```
 
 ---
 
 ## Quality Gate Severity Levels
 
-### 🔴 BLOCK (Prevents Merge)
-- Missing `PRAGMA legacy=4` on SQLCipher connection
-- Hardcoded SQLCipher key (not using `SQLCIPHER_KEY` constant)
-- Write script missing `--dry-run` support
-- Write script missing `backup_master_db()` call
-- Syntax error in any Python script
-- Test writing to real `~/Library/Pioneer/` paths
+### 🔴 **BLOCK** (Prevents Merge)
+- Test coverage below 70%
+- Migration conflicts (multiple heads)
+- Critical security issues
+- Broken imports / syntax errors
+- Failed unit tests
 
-**Action:** Must fix before commit. Orchestrator halts phase and marks as 'blocked'.
+**Action:** Agent must fix before commit. Orchestrator halts phase and marks as 'blocked'.
 
-### 🟡 WARN (Log but Allow)
-- Missing docstring on a function
-- Fixture defined in test file instead of conftest.py
-- Summary output missing from script
+### 🟡 **WARN** (Log but Allow)
+- Docstring missing on new route
+- Flaky E2E test (logs retry count)
+- Template validation warning
+- Minor style issues
 
-**Action:** Logged in PR, included in code review, does not block merge.
+**Action:** Logged in PR, included in code review, but doesn't block merge.
 
-### 🟢 INFO (Log Only)
-- Zero PRAGMA violations
-- All scripts have module docstrings
-- Tests exist and pass
+### 🟢 **INFO** (Log Only)
+- Coverage above 85% (good!)
+- Zero security warnings
+- Type checking clean
+
+**Action:** Celebrated in PR summary, increases confidence.
 
 ---
 
-## Gate-per-Agent Reference
+## Auto-Enforcement via Task-Orchestrator
+
+When task-orchestrator dispatches phases, it automatically checks gates:
+
+```yaml
+# agents.md with gates
+phases:
+  phase1:
+    agents: [migration, backend]
+    gates:
+      - schema_valid
+      - type_safe
+      - service_coverage_85pct
+    halt_on_fail: true  # Stop Phase 2 if Phase 1 gates fail
+
+  phase2:
+    agents: [frontend, test-writer, mobile-api]
+    depends_on: [phase1]
+    gates:
+      - test_coverage_70pct
+      - docstring_complete
+      - e2e_critical_pass
+    halt_on_fail: true
+
+  pre_merge:
+    gates:
+      - all_tests_pass
+      - ci_clean
+      - code_review_approved
+      - docs_updated
+    halt_on_fail: true
+```
+
+**Orchestrator Logic:**
+```
+For each phase:
+  1. Launch agents
+  2. Wait for completion
+  3. For each gate in phase.gates:
+     - Run gate check
+     - If BLOCK fails: mark phase 'blocked', halt orchestrator
+     - If WARN: log to PR, continue
+     - If INFO: log to summary
+  4. Move to next phase (or halt)
+
+Post-phase: Summarize gate results to user
+```
+
+---
+
+## Gate Implementation Details
+
+### 1. Test Coverage Gate
+
+```python
+# scripts/quality_gates/check_coverage.py
+import subprocess
+import re
+import sys
+
+def check_coverage(min_pct=70):
+    # CUSTOMIZE: Replace with your test + coverage command
+    result = subprocess.run(
+        # Example: ["pytest", "tests/", "--cov=src", "--cov-report=term-missing"]
+        ["[TEST_RUNNER]", "tests/", "--cov=src", "--cov-report=term-missing"],
+        capture_output=True, text=True
+    )
+
+    match = re.search(r'TOTAL.*?(\d+)%', result.stdout)
+    coverage = int(match.group(1)) if match else 0
+
+    if coverage < min_pct:
+        print(f"❌ Coverage {coverage}% < {min_pct}% required")
+        return False
+    print(f"✅ Coverage {coverage}% >= {min_pct}%")
+    return True
+```
+
+### 2. Migration Heads Gate
+
+```bash
+# scripts/quality_gates/check_migration_heads.sh
+# CUSTOMIZE: Replace with your migration tool's command
+[MIGRATION_COMMAND] heads --resolve-dependencies
+
+if [ $? -ne 0 ]; then
+    echo "❌ Multiple migration heads detected"
+    echo "Fix: [MIGRATION_COMMAND] merge heads -m 'merge heads'"
+    exit 1
+fi
+echo "✅ Single migration head"
+```
+
+### 3. Docstring Gate
+
+```python
+# scripts/quality_gates/check_route_docstrings.py
+import ast
+from glob import glob
+
+def check_route_docstrings(path='[routes directory]'):
+    missing = []
+    for file in glob(f'{path}/**/*.py', recursive=True):
+        tree = ast.parse(open(file).read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and has_route_decorator(node):
+                if not ast.get_docstring(node):
+                    missing.append(f"{file} - {node.name}")
+
+    if missing:
+        for m in missing:
+            print(f"⚠️  Missing docstring: {m}")
+    else:
+        print("✅ All routes have docstrings")
+```
+
+### 4. Type Safety Gate
+
+```bash
+# scripts/quality_gates/check_types.sh
+# CUSTOMIZE: Replace with your type checker
+[TYPE_CHECKER] [services directory]/ [models directory]/ --strict --ignore-missing-imports
+
+if [ $? -ne 0 ]; then
+    echo "⚠️  Type errors found (non-blocking)"
+    exit 0
+fi
+echo "✅ All types valid"
+```
+
+### 5. Custom Gate Template
+
+```python
+# scripts/quality_gates/[gate_name].py
+class QualityGate:
+    name = "gate_name"
+    description = "What this gate checks"
+    severity = "BLOCK"  # or WARN or INFO
+
+    def check(self, **context):
+        """
+        Returns: (bool, str)
+            - bool: True if gate passes
+            - str: Message to log
+        """
+        result = self._run_check()
+        message = f"Gate result: {result}"
+        return (result, message)
+
+    def _run_check(self):
+        # Implement your check here
+        pass
+
+# Register in orchestrator:
+gates_registry = {
+    'gate_name': QualityGate(),
+    # ...
+}
+```
+
+---
+
+## Integration with CI/CD
+
+### GitHub Actions Integration
+
+<!-- CUSTOMIZE: Replace with your actual CI workflow and commands -->
+
+Add quality gates to your CI workflow:
+
+```yaml
+# .github/workflows/pre-merge-validation.yml
+quality-gates:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Test Coverage (70% required)
+      run: |
+        [TEST_COMMAND] --cov=[source directory] --cov-report=term-missing -q
+        [COVERAGE_COMMAND] report --fail-under=70
+
+    - name: Type Checking
+      run: [TYPE_CHECKER] [source directory]/
+
+    - name: Migration Check
+      run: [MIGRATION_COMMAND] heads
+
+    - name: Route Docstrings
+      run: python scripts/quality_gates/check_route_docstrings.py
+```
+
+---
+
+## Gate Customization per Agent
+
+Each agent type can have specific quality gates:
 
 | Agent | Primary Gates |
 |-------|---------------|
-| **migration** | `syntax_valid`, `no_sqlcipher_on_fingerprints_db` |
-| **scripts** | `pragma_completeness`, `dry_run_present`, `backup_pattern`, `syntax_valid` |
-| **test-writer** | `tests_pass`, `no_real_library_paths`, `fixtures_centralized` |
-| **pattern-enforcer** | `pragma_completeness`, `no_hardcoded_key`, `dry_run_present`, `backup_pattern` |
-| **refactor** | `syntax_valid`, `no_behavior_change`, `tests_pass` |
+| **migration** | `schema_valid`, `single_head`, `rollback_test` |
+| **backend** | `type_safe`, `service_tests_pass`, `docstrings_complete` |
+| **frontend** | `template_syntax_valid`, `css_lint_clean`, `a11y_check` |
+| **test-writer** | `test_coverage_+10pct`, `all_tests_pass`, `no_flaky` |
+| **mobile-api** | `api_response_format`, `auth_required`, `cors_valid` |
+| **refactor** | `no_behavior_change`, `100pct_test_pass`, `coverage_maintained` |
+| **pattern-enforcer** | `no_functional_change`, `patterns_fixed_100pct` |
+
+<!-- CUSTOMIZE: Adjust gates to match your project's requirements -->
 
 ---
 
-## NEVER Merge If
-
-1. ❌ Any script has `PRAGMA key` without `PRAGMA legacy=4`
-2. ❌ SQLCipher key string appears inline in any function call
-3. ❌ Any write script is missing `--dry-run` support
-4. ❌ Any write to `master.db` doesn't call `backup_master_db()` first
-5. ❌ `collection.nml` is modified directly (not via timestamped backup copy)
-6. ❌ Tests write to `~/Library/Pioneer/` or any real library path
-
----
-
-## Reporting Gate Results
+## Reporting Quality Gate Results
 
 ### To SQL Todos Table
 
 ```sql
+-- After each phase, update todos with gate status
 INSERT INTO todo_results (todo_id, gate_name, status, result)
 VALUES
-  ('scripts-feature', 'pragma_completeness', 'pass', '✅ All 3 PRAGMAs set'),
-  ('scripts-feature', 'dry_run_present', 'pass', '✅ --dry-run in argparse'),
-  ('scripts-feature', 'backup_pattern', 'pass', '✅ backup_master_db() called');
+  ('backend-service', 'type_safe', 'pass', '✅'),
+  ('backend-service', 'coverage_70pct', 'pass', '✅ 72%'),
+  ('frontend-dashboard', 'docstring_complete', 'warn', '⚠️ 3 missing');
 ```
 
-### Summary Format
+### To PR Comment
 
 ```markdown
-## ✅ Quality Gates Summary — rekordbox-tools
+## ✅ Quality Gates Summary
 
-### Phase 1: Script Implementation (✅ PASS)
+### Phase 1: Migration + Backend (✅ PASS)
 | Gate | Result |
 |------|--------|
-| Syntax Valid | ✅ All scripts compile |
-| PRAGMA Completeness | ✅ 3/3 PRAGMAs on all connections |
-| Dry-Run Present | ✅ --dry-run in argparse |
-| Backup Pattern | ✅ backup_master_db() called |
-| No Hardcoded Key | ✅ SQLCIPHER_KEY constant used |
+| Schema Valid | ✅ Migration clean |
+| Type Safe | ✅ 0 errors |
+| Coverage 85%+ | ✅ 87% |
+| Service Tests | ✅ 156/156 pass |
 
-### Phase 2: Tests + Patterns (✅ PASS)
+### Phase 2: Frontend + Tests (⚠️ WARNINGS)
 | Gate | Result |
 |------|--------|
-| Tests Pass | ✅ 12/12 tests pass |
-| No Real Library Files | ✅ Only synthetic fixtures |
-| Pattern Enforcer | ✅ Zero violations |
+| Coverage 70%+ | ✅ 73% |
+| Docstrings | ⚠️ 2 missing (warnings/logged) |
+| E2E Critical | ✅ 12/12 pass |
+| JavaScript Lint | ✅ 0 errors |
 
-**Result:** ✅ Ready to merge — All safety gates pass
+### Pre-Merge: Final (✅ READY)
+| Gate | Result |
+|------|--------|
+| All Tests | ✅ 1247/1247 |
+| CI Clean | ✅ All workflows pass |
+| Code Review | ✅ 2 approvals |
+| Docs | ✅ Updated |
+
+**Result:** ✅ Ready to merge — All gates pass
+**Estimated savings:** 47 minutes (parallel Phase 2)
 ```
+
+---
+
+## Adding New Quality Gates
+
+**Template for custom gates:**
+
+```python
+# scripts/quality_gates/[gate_name].py
+class QualityGate:
+    name = "gate_name"
+    description = "What this gate checks"
+    severity = "BLOCK"  # or WARN or INFO
+
+    def check(self, **context):
+        """
+        Returns: (bool, str)
+            - bool: True if gate passes
+            - str: Message to log
+        """
+        result = run_check()
+        message = f"Gate result: {result}"
+        return (result, message)
+```
+
+---
+
+## Future Gate Enhancements
+
+1. **Performance Regression Detection** — Track request latency, detect slowdowns
+2. **Security Scanning** — OWASP Top 10 checks via static analysis
+3. **Database Size Monitoring** — Alert if migrations significantly increase DB size
+4. **Dependency Audit** — Scan dependency files for known CVEs
+5. **Custom Business Rules** — E.g., "all state-changing routes must have auth"
+6. **A/B Test Safety Checks** — Ensure feature flags are properly gated
+7. **Accessibility Compliance** — WCAG 2.1 AA automated checks

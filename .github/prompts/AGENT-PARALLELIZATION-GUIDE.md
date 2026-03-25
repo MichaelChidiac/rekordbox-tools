@@ -1,8 +1,9 @@
-# Agent Parallelization Strategy — rekordbox-tools
+# Agent Parallelization Strategy
 
 ## Overview
 
-Most rekordbox-tools features can be decomposed into independent tasks that multiple specialized agents can execute **simultaneously**. This dramatically accelerates development.
+Most features can be decomposed into independent tasks that multiple specialized agents
+can execute **simultaneously**. This dramatically accelerates development.
 
 ## Core Principle
 
@@ -14,113 +15,125 @@ Each agent works on its own file(s) without blocking others. Dependencies flow o
 
 | Agent | Domain | Typical Tasks | Typical Dependencies |
 |-------|--------|---------------|---------------------|
-| **scripts** | Python scripts | SQLCipher queries, XML transforms, USB export | migration (if schema changed) |
-| **test-writer** | Tests | pytest unit tests | scripts agent (code under test ready) |
-| **migration** | Schema | fingerprints.db changes | None (usually first) |
-| **refactor** | Structure | Extract shared utils, split large scripts | Nothing running in parallel |
-| **pattern-enforcer** | Consistency | Fix PRAGMA violations, missing --dry-run, etc. | Isolatable to one script |
-
-**Note:** There is no frontend/mobile-api/backend split in rekordbox-tools. All work is Python scripts or Node.js utilities.
+| **backend** | Routes, models, services | Route handlers, business logic, DB queries | migration (if schema changed) |
+| **frontend** | Templates, CSS, JS | Markup, interactivity, styling | backend routes ready |
+| **test-writer** | Tests | Unit tests, integration tests | code under test ready |
+| **migration** | Schema | Schema changes, data migrations | None (usually first) |
+| **mobile-api** | Mobile endpoints | API routes, token auth | backend services ready |
+| **refactor** | Structure | Module splits, service extraction | Nothing running in parallel |
+| **pattern-enforcer** | Consistency | Bulk fixes across many files | Isolatable to one pattern |
 
 ## Dependency Graph Rules
 
 ```
 ALWAYS SEQUENTIAL (blocking):
-  migration → scripts agent → test-writer
+  migration → backend → frontend/mobile-api → test-writer
 
 CAN BE PARALLEL (no blocking):
-  scripts agent + pattern-enforcer (different files)
-  test-writer + pattern-enforcer (different concerns)
-  multiple pattern-enforcer instances (different scripts)
+  backend + migration (independent schema)
+  frontend + mobile-api (different files)
+  frontend + test-writer (different concerns)
+  pattern-enforcer (isolated to one pattern)
 ```
 
 ## Parallelization Patterns
 
-### Pattern 1: Script + Tests (Classic)
+### Pattern 1: Backend + Frontend (Classic)
 
-**Scenario:** New script feature with unit tests.
+**Scenario:** New feature requires service logic and UI.
 
 ```
-┌─ Phase 1: Script Implementation
-│  └─ scripts agent
-│     └─ Implement [feature] in [script].py
-│        └─ Blocks: test-writer waiting for implementation
+┌─ Phase 1: Backend Infrastructure
+│  └─ backend agent
+│     └─ Create service + routes
+│        └─ Blocks: frontend waiting for route definitions
 │
-└─ Phase 2: Tests + Pattern Check (parallel)
-   ├─ test-writer agent
-   │  └─ Write pytest tests for [feature]
+└─ Phase 2: Frontend + Tests (parallel, depends on Phase 1)
+   ├─ frontend agent
+   │  └─ Create templates + JS interactions
    │
-   └─ pattern-enforcer agent
-      └─ Verify [script].py follows all patterns
+   └─ test-writer agent
+      └─ Write service + route tests
 ```
 
 **Dispatch:**
 ```
-1. Task scripts agent → wait for completion
-2. Task test-writer + Task pattern-enforcer simultaneously
+1. Task backend → wait for completion
+2. Task frontend + Task test-writer simultaneously
 3. Collect results
 ```
 
-### Pattern 2: Schema + Script + Tests (3-phase)
+### Pattern 2: Full Stack with Mobile (3-way parallel)
 
-**Scenario:** New feature requiring fingerprints.db schema change.
+**Scenario:** Same feature exposed via web UI AND mobile API.
 
 ```
-┌─ Phase 1: Schema
-│  └─ migration agent
-│     └─ Add column/table to fingerprints.db
-│        └─ Blocks: scripts agent
+┌─ Phase 1: Shared Service
+│  └─ backend agent
+│     └─ Create shared service
+│        └─ Blocks: mobile, frontend, tests
 │
-├─ Phase 2: Implementation
-│  └─ scripts agent
-│     └─ Use new schema in find_duplicates.py
-│        └─ Blocks: test-writer
-│
-└─ Phase 3: Tests + Quality (parallel)
-   ├─ test-writer agent
-   │  └─ Write tests
+└─ Phase 2: All consumers (parallel)
+   ├─ mobile-api agent
+   │  └─ Add /api/[feature] endpoint
    │
-   └─ pattern-enforcer agent
-      └─ Verify compliance
+   ├─ frontend agent
+   │  └─ Add web UI
+   │
+   └─ test-writer agent
+      └─ Write tests for all endpoints
 ```
 
 **Dispatch:**
 ```
-1. Task migration agent → wait for completion
-2. Task scripts agent → wait for completion
-3. Task test-writer + Task pattern-enforcer simultaneously
+1. Task backend → wait for completion
+2. Task mobile-api + Task frontend + Task test-writer simultaneously
+3. Collect results
+```
+
+### Pattern 3: Schema + Everything
+
+**Scenario:** New feature requires DB schema changes.
+
+```
+┌─ Phase 1: Migration (creates schema)
+│  └─ migration agent
+│     └─ Add new tables/columns
+│        └─ Blocks: backend code that uses those columns
+│
+└─ Phase 2: Backend (depends on Phase 1)
+   └─ backend agent
+      └─ Use new schema in service layer
+         └─ Blocks: frontend + tests
+```
+
+**Dispatch:**
+```
+1. Task migration → wait for completion
+2. Task backend → wait for completion
+3. Task frontend + Task test-writer simultaneously
 4. Collect results
 ```
 
-### Pattern 3: Bulk Pattern Enforcement (Independent)
+### Pattern 4: Bulk Pattern Enforcement (Independent)
 
-**Scenario:** Fix missing `PRAGMA legacy=4` across all scripts.
+**Scenario:** Replace a deprecated pattern throughout codebase.
 
 ```
-Split work by script:
-├─ pattern-enforcer (traktor_to_rekordbox.py)       ─┐
-├─ pattern-enforcer (rebuild_rekordbox_playlists.py)  ├─ all simultaneously
-└─ pattern-enforcer (cleanup_rekordbox_db.py)        ─┘
+Split work by directory:
+├─ pattern-enforcer (routes/)      ─┐
+├─ pattern-enforcer (services/)     ├─ all simultaneously
+└─ pattern-enforcer (models/)      ─┘
 Each is independent, can run together.
 ```
 
 **Dispatch:**
 ```
-1. Task pattern-enforcer (traktor_to_rekordbox.py)
-2. Task pattern-enforcer (rebuild_rekordbox_playlists.py)
-3. Task pattern-enforcer (cleanup_rekordbox_db.py)
+1. Task pattern-enforcer (routes)
+2. Task pattern-enforcer (services)
+3. Task pattern-enforcer (models)
    (all three simultaneously)
-4. Collect + verify
-```
-
-### Pattern 4: Refactor → Tests
-
-**Scenario:** Extract SQLCipher connection to `utils/db.py`, then update tests.
-
-```
-1. Task refactor agent → Extract to utils/db.py
-2. Task test-writer → Update imports, add utils tests
-   (sequential — test-writer needs refactor to be done)
+4. Collect + merge results
 ```
 
 ## Decision Tree: When to Parallelize
@@ -129,17 +142,18 @@ Each is independent, can run together.
 START: Do I have multiple independent tasks?
 │
 ├─ YES: Do they touch the same file?
-│       ├─ YES → Sequence them
-│       └─ NO → Parallelize!
+│       ├─ YES → Sequence them (one agent per file to avoid conflicts)
+│       └─ NO → Parallelize! Dispatch simultaneously
 │
 └─ NO: Execute single agent sequentially
 ```
 
 ## When NOT to Parallelize
 
-❌ **Same script edits:** Two agents editing the same `.py` file
-❌ **Tight coupling:** script agent depends on migration agent completing first
-❌ **Order-dependent:** backup utilities must exist before scripts that use them
+❌ **Schema conflicts:** Two migrations touching the same table
+❌ **Tight coupling:** Service A depends on Service B being fully implemented first
+❌ **Same file edits:** Two agents trying to edit the same file
+❌ **Order-dependent logic:** Initialization steps that must happen in sequence
 
 ## Agent Coordination
 
@@ -147,46 +161,62 @@ When dispatching multiple agents simultaneously:
 
 1. **Set SQL status to "in_progress"** for all tasks
    ```sql
-   UPDATE todos SET status = 'in_progress' WHERE id IN ('scripts-feature', 'tests-feature');
+   UPDATE todos SET status = 'in_progress' WHERE id IN ('backend-feature', 'frontend-feature');
    ```
 
-2. **Provide complete context** — agents are stateless
+2. **Provide complete context** in the prompt — agents are stateless
    - Reference the other agent's work
-   - Link to the same script file
+   - Link to the same architecture doc
    - Mention file paths clearly
 
-3. **Collect results** when all complete
+3. **Collect results** when all agents complete
+   - Use `read_agent()` to fetch outputs
+   - Verify no conflicts (git diff)
+   - Merge as one atomic commit if possible
 
 4. **Update SQL status to "done"**
    ```sql
-   UPDATE todos SET status = 'done' WHERE id IN ('scripts-feature', 'tests-feature');
+   UPDATE todos SET status = 'done' WHERE id IN ('backend-feature', 'frontend-feature');
    ```
 
-## Example Prompt for Parallel Scripts Task
+## Example Prompt for Parallel Backend Task
 
 ```markdown
-# Scripts Agent: [Feature]
+# Backend: [Feature] Service
 
-**Context:** Part of a 2-parallel-agent task.
-**Parallel Agents:** test-writer (tests), pattern-enforcer (compliance check)
-**Blocks:** Both downstream agents wait for this to complete
+**Context:** Part of a 3-parallel-agent task. See .github/prompts/issue-NNN-title/agents.md
+
+**Parallel Agents:** frontend (template UI), mobile-api (read endpoint), test-writer (tests)
+
+**Blocks:** All downstream agents wait for this to complete
 
 **What to build:**
-1. In [script].py, add function [function_name]:
-   - Parameters: [params]
-   - Returns: [return type]
-   - Behavior: [description]
+1. Create [services directory]/[feature]_service.py
+   - create_item(name, data): returns ItemID
+   - get_items(filters): returns list
+   - update_item(id, data): returns updated item
+   - delete_item(id): returns bool
 
-2. Add --[flag] CLI argument to argparse
+2. Add routes in [routes directory]/[feature].py
+   - POST /api/[feature] — create
+   - GET /api/[feature] — list
+   - PATCH /api/[feature]/<id> — update
+   - DELETE /api/[feature]/<id> — delete
 
-3. Respect --dry-run: print preview, don't modify DB
+3. Add tests to tests/test_[feature]_service.py
 
-**Files to modify:**
-- [script].py (MODIFY)
+**Files to create/modify:**
+- [services directory]/[feature]_service.py (NEW)
+- [routes directory]/[feature].py (NEW or EXTEND)
+- tests/test_[feature]_service.py (NEW)
 
 **Dependencies:**
-- Migration DONE (if applicable)
-- SQLCipher connection pattern in .github/instructions/database-rules.md
+- Migration DONE: New tables/columns exist
+- See: [models directory]/[feature].py for schema
+
+**What frontend will build on top of this:**
+- Templates that call the API endpoints
+- See: templates/[feature]/ (will be created simultaneously)
 ```
 
 ## Parallelization Checklist
@@ -198,5 +228,4 @@ When dispatching multiple agents simultaneously:
 - [ ] Dispatch agents with complete context
 - [ ] Monitor progress in SQL `todos` table
 - [ ] Collect results when all complete
-- [ ] Syntax check: `python3.11 -m py_compile *.py`
 - [ ] Merge into atomic commit(s)

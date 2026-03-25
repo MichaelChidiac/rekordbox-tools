@@ -1,4 +1,4 @@
-# Prompts Directory Organization Guide — rekordbox-tools
+# Prompts Directory Organization Guide
 
 This directory contains planning documents, issue templates, and prompt context for features and tasks.
 
@@ -13,11 +13,14 @@ For each new issue or feature being planned, create an organized folder:
 │   ├── plan.md                            # Implementation plan & architecture
 │   ├── agents.md                          # Agent parallelization strategy
 │   ├── acceptance-criteria.md             # Testable completion checklist
+│   ├── generated-issue.md                 # GitHub issue template (if delegating to AI)
 │   └── notes.md                           # Implementation notes, decisions, blockers
 │
-├── AGENT-PARALLELIZATION-GUIDE.md         # Guide for parallel agent execution
+├── issue-template.md                      # (Master template — do not move/edit)
+├── current-task.md                        # (Active task context — updated per session)
 ├── FOLDER-ORGANIZATION.md                 # (This file)
-└── NEW-ISSUE-QUICK-START.md               # Quick reference for new folders
+├── AGENT-PARALLELIZATION-GUIDE.md         # (Guide for parallel agent execution)
+└── NEW-ISSUE-QUICK-START.md               # (Quick reference for new folders)
 ```
 
 ## Workflow
@@ -51,20 +54,14 @@ For each new issue or feature being planned, create an organized folder:
    ```markdown
    # Implementation Plan
 
-   ## High-Risk Files Touched
-   - [ ] collection.nml — [yes/no] — if yes: backup + write copy only
-   - [ ] master.db — [yes/no] — if yes: backup before write + dry-run first
-   - [ ] exportLibrary.db — [yes/no] — if yes: dry-run first
-   - [ ] masterPlaylists6.xml — [yes/no] — if yes: sync with DB changes
-
    ## Approach
-   [High-level strategy]
+   [High-level architecture / approach]
 
    ## Changes Required
-   - Scripts: [which scripts change]
-   - Database: [fingerprints.db changes, master.db read/write]
-   - CLI: [new flags]
-   - Tests: [what to test]
+   - Database: [schema changes]
+   - Backend: [service/route changes]
+   - Frontend: [UI changes]
+   - Tests: [test coverage needed]
    ```
 
    **agents.md** — Document agent parallelization strategy:
@@ -75,18 +72,16 @@ For each new issue or feature being planned, create an organized folder:
    # Acceptance Criteria
 
    - [ ] Feature works as described
-   - [ ] --dry-run shows correct preview without modifying files
-   - [ ] Backup created before any master.db write
-   - [ ] Tests pass: `python3.11 -m pytest tests/ -x`
-   - [ ] No regressions on existing CLI flags
-   - [ ] python3.11 -m py_compile [script].py exits 0
+   - [ ] Tests pass: `[test command]`
+   - [ ] No regressions
+   - [ ] Documentation updated
    ```
 
 4. **Execute the plan:**
 
    Option A — Manual dispatch:
    ```
-   Use the scripts agent to [task from agents.md]
+   Use the backend agent to [task from agents.md]
    ```
 
    Option B — Automated orchestration:
@@ -103,26 +98,39 @@ For each new issue or feature being planned, create an organized folder:
    mv ".github/prompts/issue-NNN-title/plan.md" "docs/implemented/[feature]-design.md"
    ```
 
+   Update `docs/implemented/README.md` with the commit SHA and PR number.
+
+<!-- CUSTOMIZE: Remove or replace the example below with one from your project -->
+
+## Existing Files
+
+| File | Purpose | Maintain? |
+|------|---------|-----------|
+| `issue-template.md` | Master template for GitHub issues | ✅ Yes — do not move |
+| `current-task.md` | Context for active session work | ✅ Yes — update per session |
+
 ## Best Practices
 
-- **Use descriptive folder names:** `issue-12-usb-history-import` (not `feature-1`)
-- **Always flag high-risk files:** `collection.nml`, `master.db`, `exportLibrary.db`
-- **Always create `agents.md`:** Even for simple features — documents intent
-- **Archive completed work:** Rename with `_DONE` suffix or move to `docs/implemented/`
-- **Link back:** Reference the GitHub issue number, commit SHA, and PR number once implemented
+- **Use descriptive folder names:** `issue-142-user-notifications` (not `feature-1`)
+- **Keep everything in one place:** Don't scatter planning files across multiple directories
+- **Always create `agents.md`:** Even for simple features — it documents intent and parallelization strategy (see AGENT-PARALLELIZATION-GUIDE.md)
+- **Archive completed work:** Move finalized designs to `docs/implemented/`
+- **Link back:** In prompts folders, always reference the GitHub issue number, commit SHA, and PR number once implemented
+- **Reuse structure:** When creating a new feature, follow this folder template
 
 ## Example Structure
 
 ```
-.github/prompts/issue-12-usb-history-import/
-├── prompt.md           # "Import USB HISTORY playlist into Traktor NML"
-├── plan.md             # High-risk: collection.nml (backup + write copy), NML parser
-├── agents.md           # Phase 1 (scripts), Phase 2 (test-writer + pattern-enforcer)
+.github/prompts/issue-256-checklist-feature/
+├── prompt.md           # "Add checklist templates + event checklists"
+├── plan.md             # Models, service layer, UI architecture
+├── agents.md           # Phase 1 (migration→backend), Phase 2 (frontend+tests)
 ├── acceptance-criteria.md
-└── notes.md            # "pdb_to_traktor.py already has backup logic — reuse it"
+└── notes.md            # "Using JSON for task storage, not separate rows"
 
 AFTER COMPLETION:
 docs/implemented/
-├── design-usb-history-import.md   # Finalized design
+├── design-checklist-feature.md    # Finalized design (moved from prompts)
+├── related-commits.txt            # f99bc74, 140d557
 └── README.md                      # Master index
 ```

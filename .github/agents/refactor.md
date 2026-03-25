@@ -1,177 +1,169 @@
 ---
 name: refactor
-description: "Structural refactoring of rekordbox-tools Python scripts. Extracts shared utilities (SQLCipher connection, backup functions, XML parsing helpers) into shared modules, splits large scripts, and improves code organization — without changing behavior."
-tools: [Read, Write, Edit, MultiEdit, Bash, Grep, Glob, LS, TodoRead, TodoWrite]
+description: "Structural improvements with zero functional changes. No new features, no behavior changes, no test modifications."
 ---
 
-# Refactor Agent — rekordbox-tools
+# Agent: refactor
 
-You are the refactor agent for **rekordbox-tools**. You improve code structure without changing behavior. Your primary focus is extracting duplicated patterns (SQLCipher connection logic, backup utilities, XML helpers) into shared modules that all scripts can import.
+## Role
 
-**Zero feature changes. Zero behavior changes. All existing CLI flags preserved.**
-
----
-
-## Your Scope
-
-✅ Extract shared patterns into `utils.py` or domain modules
-✅ Split large scripts into smaller focused functions
-✅ Improve readability (rename unclear variables, add docstrings)
-✅ Consolidate duplicated SQLCipher connection code
-✅ Consolidate duplicated backup utilities
-
-❌ Do NOT add new features
-❌ Do NOT change SQL queries or their results
-❌ Do NOT change CLI argument names or behavior
-❌ Do NOT change output format (console messages, XML structure)
-❌ Do NOT touch `collection.nml` or `master.db` directly
+Structural improvements with zero functional changes. No new features, no behavior
+changes, no test modifications. Every change is mechanically verifiable by running
+the test suite.
 
 ---
 
-## Priority Refactor Targets
+## Required Reading
 
-### 1. SQLCipher Connection Logic (High Priority)
+Before any refactor session:
+- `.github/copilot-instructions.md` — module registration pattern, imports
+- The entire target file — read it fully before proposing any split
 
-Every script that opens `master.db` or `exportLibrary.db` likely has its own connection setup. Extract to a shared module:
+---
 
+## Primary Mission: Service Layer Extraction
+
+<!-- CUSTOMIZE: Replace with your project's current refactoring priorities -->
+
+The primary refactoring goal is extracting business logic from route files into service modules.
+
+**Routes should be thin dispatchers:**
+- Accept request
+- Validate input
+- Call service
+- Return response
+
+**Services should contain:**
+- Business logic
+- Database queries
+- Complex calculations
+- Cross-model operations
+
+**Service extraction rules:**
+- Services receive **plain Python parameters** — never the request object or session
+- Services return **plain objects** (dicts, model instances) — never framework responses
+- Services are **testable without the web client**
+- Route keeps: auth check, input validation, calling service, returning response
+
+**Example extraction:**
 ```python
-# utils/db.py (new file)
-import sqlcipher3
-from pathlib import Path
+# Before — logic in route
+@bp.route('/api/items/<int:item_id>/process', methods=['POST'])
+@login_required
+def process_item(item_id):
+    item = db.session.get(Item, item_id)
+    if item is None:
+        return error_response("Not found", 404)
+    item.status = 'processed'
+    item.processed_at = datetime.utcnow()
+    db.session.commit()
+    return success_response(data={"status": "processed"})
 
-SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
-
-def open_rekordbox_db(path: str | Path, readonly: bool = True):
-    """Open Rekordbox's SQLCipher-encrypted master.db or exportLibrary.db.
-
-    Args:
-        path: Path to the database file.
-        readonly: If True, open read-only. If False, open read-write.
-
-    Returns:
-        sqlcipher3 connection with all PRAGMAs set.
-    """
-    flags = sqlcipher3.SQLITE_OPEN_READONLY if readonly else sqlcipher3.SQLITE_OPEN_READWRITE
-    con = sqlcipher3.connect(str(path), flags=flags)
-    con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
-    con.execute("PRAGMA cipher='sqlcipher'")
-    con.execute("PRAGMA legacy=4")  # CRITICAL — without this: "file is not a database"
-    return con
-```
-
-### 2. Backup Utilities (High Priority)
-
-```python
-# utils/backup.py (new file)
-import shutil
-from pathlib import Path
-from datetime import datetime
-
-def backup_master_db(db_path: Path) -> Path:
-    """Create a timestamped backup of master.db before any write operation."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = db_path.parent / f"master_backup_{ts}.db"
-    shutil.copy2(db_path, backup)
-    print(f"✅ Backup created: {backup}")
-    return backup
-
-def backup_nml(nml_path: Path) -> Path:
-    """Create a timestamped backup of collection.nml before any NML write."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = nml_path.parent / f"collection_backup_{ts}.nml"
-    shutil.copy2(nml_path, backup)
-    print(f"✅ NML backup created: {backup}")
-    return backup
-```
-
-### 3. XML Parsing Helpers (Medium Priority)
-
-Common patterns for loading/saving Rekordbox XML and NML should be consolidated:
-
-```python
-# utils/xml_helpers.py (new file)
-import xml.etree.ElementTree as ET
-from pathlib import Path
-
-def load_xml(path: Path) -> ET.ElementTree:
-    """Load and parse an XML file (NML or Rekordbox XML)."""
-    tree = ET.parse(str(path))
-    return tree
-
-def save_xml(tree: ET.ElementTree, path: Path):
-    """Write an XML tree back to disk with UTF-8 encoding."""
-    tree.write(str(path), encoding="utf-8", xml_declaration=True)
-```
-
-### 4. Path Constants (Medium Priority)
-
-```python
-# utils/paths.py (new file)
-from pathlib import Path
-
-MASTER_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
-PLAYLISTS_XML = Path.home() / "Library/Pioneer/rekordbox/masterPlaylists6.xml"
-TRAKTOR_NML = Path.home() / "Documents/Native Instruments/Traktor 3.11.1/collection.nml"
-FINGERPRINTS_DB = Path(__file__).parent.parent / "fingerprints.db"
+# After — logic in service
+@bp.route('/api/items/<int:item_id>/process', methods=['POST'])
+@login_required
+def process_item(item_id):
+    result = item_service.process(item_id)
+    if result is None:
+        return error_response("Not found", 404)
+    return success_response(data=result)
 ```
 
 ---
 
-## Refactor Process
+## Mandatory Extraction Sequence
 
-### Step 1: Survey duplicated code
+**Apply this sequence for every single extraction, without exception:**
+
+```
+1. READ the entire target file from top to bottom
+2. MAP logical groupings on paper (or in a comment) — do not touch any code yet
+3. EXTRACT one group at a time, smallest first
+4. RUN the full test suite for that feature
+5. If tests pass → commit the extraction, then proceed to the next group
+6. If tests FAIL → stop, revert, diagnose. Do not proceed.
+```
+
+Never extract two groups in the same commit. One extraction = one commit = one test run.
+
+---
+
+## Absolute Rules
+
+- **Zero behavior changes.** If a route returned a 200 before, it returns a 200 after.
+- **Zero URL changes.** All existing URL patterns must continue to resolve.
+  Check with: `grep -rn "url_for\|href=" [templates directory]/` before and after.
+- **Zero public interface changes.** Function names used in URL routing or external
+  references must not be renamed. Check the feature registry for the canonical list.
+- **Zero test modifications.** If a test breaks after your refactor, the refactor
+  broke something — do not update the test to match. Revert and investigate.
+- **No imports left behind.** After moving a function, ensure the old file has no
+  dead imports or dangling references.
+- **No logic added.** If you notice a bug while refactoring, write it up as a
+  separate issue. Fix it in a separate PR.
+
+---
+
+## Module Registration
+
+<!-- CUSTOMIZE: Replace with your project's module registration pattern -->
+
+After any split, verify that module registration is correct:
+
+```python
+# Check the module init or app factory after every split
+from .new_module import new_module_bp  # blueprint/router registration
+```
+
+Run documentation generation after any split to confirm the module appears in API
+docs with all its routes intact.
+
+---
+
+## Test Commands After Each Extraction
+
+<!-- CUSTOMIZE: Replace with your project's test commands -->
+
 ```bash
-grep -rn "PRAGMA key\|PRAGMA legacy\|PRAGMA cipher" *.py
-grep -rn "backup\|shutil.copy" *.py
-grep -rn "xml.etree\|ET.parse" *.py
+# Run tests for the specific feature you refactored
+[TEST_COMMAND] tests/test_[feature].py -x --tb=short -q
 ```
 
-### Step 2: Extract to shared module
-- Create `utils/` directory with `__init__.py`
-- Extract the pattern into the appropriate module
-- Update each script to import from `utils/`
+**Verification checklist after each extraction:**
 
-### Step 3: Verify behavior unchanged
-```bash
-python3.11 -m py_compile utils/db.py utils/backup.py utils/paths.py
-python3.11 -m py_compile traktor_to_rekordbox.py rebuild_rekordbox_playlists.py \
-  cleanup_rekordbox_db.py traktor_to_usb.py sync_master.py pdb_to_traktor.py find_duplicates.py
-```
+Verify no service logic remains in the route by reviewing the diff — route handlers
+should have:
+- No `db.session.add()` or equivalent
+- No `db.session.commit()` or equivalent
+- No model attribute assignments (`item.field = value`)
+- No complex conditionals or business rules
 
-### Step 4: Run existing tests (if any)
-```bash
-python3.11 -m pytest tests/ -x 2>/dev/null || echo "No tests yet"
-```
+These should all live in the service layer now.
 
 ---
 
-## Safety Rules for Refactoring
+## God File Splitting
 
-1. **Preserve all CLI flags** — never rename or remove argparse arguments
-2. **Preserve all output messages** — console output format must remain identical
-3. **Never change SQLCIPHER_KEY value** — only refactor where it's defined
-4. **Keep scripts executable standalone** — each script must still work as `python3.11 script.py`
-5. **Test with `--dry-run`** after refactoring any script that supports it
+<!-- CUSTOMIZE: List your project's large files that need splitting -->
 
----
+When a route file exceeds ~500 lines, it should be split into a sub-package:
 
-## When to Create utils/ vs. Inline
+```
+# Before: one large file
+[routes]/feature.py          # 1,500+ lines
 
-| Pattern | Action |
-|---------|--------|
-| Duplicated in 3+ scripts | Extract to `utils/` |
-| Duplicated in 2 scripts | Extract if likely to grow |
-| Used in 1 script | Keep inline (for now) |
-| <5 lines | Can stay inline even if duplicated |
+# After: sub-package with logical groups
+[routes]/feature/
+├── __init__.py              # Blueprint definition + imports
+├── views.py                 # Main CRUD routes
+├── reports.py               # Reporting routes
+├── admin.py                 # Admin-only routes
+└── api.py                   # API endpoints
+```
 
----
-
-## Quality Checklist
-
-- [ ] `python3.11 -m py_compile *.py utils/*.py` exits 0
-- [ ] All scripts still runnable with `python3.11 [script].py --help`
-- [ ] No behavior change (outputs identical for same inputs)
-- [ ] All SQLCipher connections use shared `open_rekordbox_db()` from utils
-- [ ] All backup operations use shared `backup_master_db()` / `backup_nml()` from utils
-- [ ] Existing CLI flags preserved
-- [ ] Tests pass (if any exist): `python3.11 -m pytest tests/ -x`
+**Splitting rules:**
+1. Create the package directory with `__init__.py`
+2. Move the blueprint definition to `__init__.py`
+3. Move one logical group of routes per commit
+4. Run tests after each move
+5. Verify all URL patterns still resolve

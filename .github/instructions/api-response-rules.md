@@ -1,231 +1,144 @@
-# Script Output Rules — rekordbox-tools (Strict Enforcement)
+# API Response Rules (Strict Enforcement)
 
-> These rules apply to ALL console output from rekordbox-tools Python scripts.
-> There are no JSON APIs, no HTTP responses — just terminal output.
-
----
-
-## Output Principles
-
-1. **Dry-run output is always prefixed with `[dry-run]`**
-2. **Success indicators use `✅`**
-3. **Warning indicators use `⚠️`**
-4. **Error indicators use `❌`**
-5. **Progress on long operations uses `tqdm`**
-6. **Final summary always shows counts and paths**
+> These rules apply to ALL JSON API responses in your route handlers.
 
 ---
 
-## Dry-Run Output Format
+## Required: Use Response Helpers
 
-Every `--dry-run` line must be prefixed with `[dry-run]`:
+<!-- CUSTOMIZE: Replace helper names with your project's actual function names -->
+
+**NEVER** construct JSON responses manually. Always use response helper functions:
 
 ```python
-# ✅ CORRECT
-if dry_run:
-    print("[dry-run] No files will be modified.")
-    print(f"[dry-run] Would read:   {nml_path}")
-    print(f"[dry-run] Would delete: {delete_count} playlists from master.db")
-    print(f"[dry-run] Would insert: {insert_count} playlists into master.db")
-    print(f"[dry-run] Would update: {PLAYLISTS_XML}")
-    return
+# ✅ CORRECT — use helpers
+return success_response(data={"id": item.id})
+return error_response("Item not found", 404)
+return created_response(data={"id": new_item.id})
+return deleted_response()
 
-# ❌ WRONG — no prefix, user can't tell what's real vs simulated
-print(f"Would delete {delete_count} playlists")
+# ❌ WRONG — manual construction (use helpers instead)
+return json_response({"success": True, "data": {...}}), 200
+return json_response({"error": "Not found"}), 404
+return json_response({"status": "success"}), 200
 ```
 
 ---
 
-## Status Indicators
+## HTTP Status Code Rules
 
-| Symbol | Meaning | When to use |
-|--------|---------|-------------|
-| `✅` | Success / complete | Operation succeeded, backup created, sync done |
-| `⚠️` | Warning / attention needed | Non-fatal issue, something was skipped |
-| `❌` | Error | Fatal error before exit |
-| `→` | Progress step | Sub-step within a larger operation |
+| Action | Status Code | Helper |
+|--------|-------------|--------|
+| GET success | 200 | `success_response(data=...)` |
+| PUT/PATCH update | 200 | `success_response(data=..., message="Updated")` |
+| POST create | **201** | `created_response(data=...)` |
+| DELETE | **204** | `deleted_response()` |
+| Validation error | 400 | `error_response("message", 400)` |
+| Not authenticated | 401 | `error_response("Not authenticated", 401)` |
+| Not authorized | 403 | `error_response("Not authorized", 403)` |
+| Not found | 404 | `error_response("Resource not found", 404)` |
+| Conflict/duplicate | 409 | `error_response("Already exists", 409)` |
+| Server error | 500 | `error_response(str(e), 500)` |
 
-```python
-# ✅ Success
-print(f"✅ Backup created: {backup_path}")
-print(f"✅ Complete: {count} playlists inserted")
-
-# ⚠️ Warning
-print(f"⚠️  Track not found in NML: {file_path}")
-print(f"⚠️  Skipping {count} tracks with no LOCATION element")
-
-# ❌ Error (then sys.exit(1))
-print(f"❌ master.db not found: {MASTER_DB}", file=sys.stderr)
-sys.exit(1)
-
-# → Progress step
-print(f"→ Parsing NML: {nml_path}")
-print(f"→ Building playlist tree...")
-print(f"→ Writing to master.db...")
-```
+<!-- CUSTOMIZE: Adjust helper names and add/remove status codes for your project -->
 
 ---
 
-## Progress Reporting with tqdm
+## Response Envelope
 
-Use `tqdm` for any loop over ~100+ items:
+All JSON responses follow this shape:
 
-```python
-from tqdm import tqdm
+```json
+// Success
+{
+  "success": true,
+  "data": { ... },          // optional
+  "message": "Created"      // optional
+}
 
-# ✅ CORRECT — tqdm with description and unit
-for track in tqdm(tracks, desc="Inserting tracks", unit="track"):
-    insert_track(con, track)
+// Error
+{
+  "success": false,
+  "error": "Human-readable message",
+  "details": { ... }        // optional (validation errors, etc.)
+}
 
-# For nested operations, nest tqdm bars:
-for playlist in tqdm(playlists, desc="Playlists", unit="playlist"):
-    for track in tqdm(playlist["tracks"], desc=f"  {playlist['name']}", leave=False):
-        ...
-
-# ❌ WRONG — manual counter with print
-for i, track in enumerate(tracks):
-    print(f"Processing {i}/{len(tracks)}...")
-    insert_track(con, track)
+// Paginated list
+{
+  "success": true,
+  "data": [ ... ],
+  "meta": {
+    "total": 100,
+    "page": 1,
+    "per_page": 20,
+    "pages": 5
+  }
+}
 ```
+
+<!-- CUSTOMIZE: Adjust envelope shape to match your project's convention -->
 
 ---
 
-## Summary Output Format
+## Pagination Format
 
-Every script must end with a summary:
+List endpoints that can return large datasets must support pagination:
+
+Query parameters: `?page=1&per_page=20&sort=created_at&order=desc`
 
 ```python
-print(f"\n{'='*50}")
-print(f"✅ {script_name} complete")
-print(f"{'='*50}")
-print(f"   Source:             {nml_path}")
-print(f"   Playlists deleted:  {deleted_count}")
-print(f"   Playlists inserted: {inserted_count}")
-print(f"   Tracks processed:   {track_count}")
-print(f"   XML updated:        {PLAYLISTS_XML}")
-print(f"   Backup:             {backup_path}")
-if dry_run:
-    print(f"\n   [dry-run] — no changes were made")
+# ✅ Use pagination helper
+return paginated_response(items, page=1, total=100, per_page=20)
 ```
 
 ---
 
 ## Error Messages
 
-Errors go to `stderr`, then the script exits with code 1:
+- Error strings MUST be human-readable (not stack traces in production)
+- Use `str(e)` only in 500 responses, and only in development
+- Validation errors: use `error_response("Validation failed", 400, details=errors)`
+- Be specific: "Item not found" not just "Not found"
 
-```python
-# ✅ CORRECT
-print(f"❌ Error: {e}", file=sys.stderr)
-sys.exit(1)
+### Validation Error Details
 
-# ✅ For missing required files
-if not nml_path.exists():
-    print(f"❌ NML file not found: {nml_path}", file=sys.stderr)
-    print(f"   Is Traktor installed? Expected: {TRAKTOR_NML}", file=sys.stderr)
-    sys.exit(1)
+Include field-level details for validation errors:
 
-# ❌ WRONG — error to stdout, no exit code
-print(f"Error: {e}")
-```
-
-### Error Messages Must Be Actionable
-
-Error messages should tell the user what to do:
-
-```python
-# ✅ CORRECT — actionable
-print(f"❌ Cannot write to master.db: {MASTER_DB}", file=sys.stderr)
-print(f"   Is Rekordbox running? Close it before running this script.", file=sys.stderr)
-
-# ❌ WRONG — not actionable
-print(f"❌ Database error: permission denied", file=sys.stderr)
+```json
+{
+  "success": false,
+  "error": "Validation failed",
+  "details": {
+    "email": ["Not a valid email address"],
+    "password": ["Must be at least 8 characters"]
+  }
+}
 ```
 
 ---
 
-## Backup Confirmation Output
+## When This Applies
 
-Always print the backup path when a backup is created:
+- All routes that return JSON responses
+- All routes with API authentication decorators
+- All routes under `/api/` URL prefix
+- AJAX handlers that return JSON (even if the route also has HTML rendering)
 
-```python
-def backup_master_db(db_path: Path) -> Path:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = db_path.parent / f"master_backup_{ts}.db"
-    shutil.copy2(db_path, backup)
-    print(f"✅ Backup created: {backup}")
-    return backup
-```
+**Exception:** HTML form routes that return rendered templates or redirects are
+NOT covered by these rules — they follow standard framework patterns.
 
 ---
 
-## Interactive Prompts (questionary)
+## JavaScript Client Unwrapping
 
-For destructive operations (wipe all playlists, overwrite NML), use `questionary` to confirm:
+All frontend JS must unwrap the envelope:
 
-```python
-import questionary
+```javascript
+// ✅ Correct — unwrap the envelope
+const result = await response.json();
+const items = result.data;
 
-if not dry_run:
-    confirmed = questionary.confirm(
-        f"This will DELETE all {count} playlists from master.db and rebuild from NML. Continue?",
-        default=False
-    ).ask()
-    if not confirmed:
-        print("Aborted.")
-        sys.exit(0)
+// ❌ Wrong — data IS the envelope, not the payload
+const items = await response.json();
+items.forEach(...);  // CRASH: items is {success: true, data: [...]}
 ```
-
-**Exception:** If `--force` is passed, skip the confirmation prompt.
-
----
-
-## --help Output Quality
-
-Every script's `--help` must be clear and include example usage:
-
-```python
-parser = argparse.ArgumentParser(
-    description="Rebuild all playlists in Rekordbox master.db from Traktor NML.",
-    epilog="""
-Examples:
-  python3.11 rebuild_rekordbox_playlists.py --dry-run
-  python3.11 rebuild_rekordbox_playlists.py
-  python3.11 rebuild_rekordbox_playlists.py --nml ~/Dropbox/collection.nml
-
-IMPORTANT: Close Traktor and Rekordbox before running.
-    """
-)
-```
-
----
-
-## Verbosity Levels (Optional)
-
-If a script supports `--verbose`:
-
-```python
-parser.add_argument("--verbose", "-v", action="store_true",
-                    help="Show detailed per-item output")
-
-# Usage
-if args.verbose:
-    print(f"  → Track {i}: {title} ({artist})")
-```
-
-Without `--verbose`, only show progress bars and summary.
-
----
-
-## Quality Checklist
-
-Before submitting any script:
-- [ ] Dry-run output uses `[dry-run]` prefix on every line
-- [ ] Status indicators: `✅` success, `⚠️` warning, `❌` error
-- [ ] Errors go to `stderr` and exit with code 1
-- [ ] Error messages include actionable guidance
-- [ ] `tqdm` used for loops >100 items
-- [ ] Final summary shows counts and paths
-- [ ] Backup path printed after creating backup
-- [ ] Destructive operations use `questionary` confirmation
-- [ ] `--help` includes example usage

@@ -1,4 +1,4 @@
-# New Issue Quick Start — rekordbox-tools
+# New Issue Quick Start
 
 Paste this reference when creating a new feature/issue folder.
 
@@ -12,7 +12,7 @@ mkdir -p ".github/prompts/issue-NNN-[title]"
 touch ".github/prompts/issue-NNN-[title]"/{prompt,plan,agents,acceptance-criteria,notes}.md
 
 # 3. Fill in prompt.md (original request)
-# 4. Fill in plan.md (flag high-risk files: collection.nml, master.db, exportLibrary.db)
+# 4. Fill in plan.md (architecture)
 # 5. Generate agents.md (ask AI to use SMART-DISPATCH)
 # 6. Fill in acceptance-criteria.md
 
@@ -22,99 +22,83 @@ touch ".github/prompts/issue-NNN-[title]"/{prompt,plan,agents,acceptance-criteri
 
 ---
 
-## agents.md Template for rekordbox-tools (copy-paste)
+## agents.md Template (copy-paste)
 
 ```markdown
 # Agent Dispatch Plan
 
-## Phase 1: Schema (if fingerprints.db changes needed)
+## Phase 1: Foundation (sequential)
 
-- [ ] **migration agent** — Add [column/table] to fingerprints.db
-  - Files: find_duplicates.py (schema init) or new migration script
+- [ ] **migration agent** — Add [feature] schema
+  - Files: migrations/versions/[filename]
   - Depends on: (none)
-  - Blocks: scripts agent
+  - Blocks: backend agent
   - Est time: 15 min
 
-## Phase 2: Script Implementation
+- [ ] **backend agent** — [Feature]Service + routes
+  - Files: src/services/[feature]_service.py, src/routes/[feature].py
+  - Depends on: migration agent
+  - Blocks: frontend agent, test-writer
+  - Est time: 45 min
 
-- [ ] **scripts agent** — [Feature] in [script].py
-  - Files: [script].py
-  - Depends on: migration agent (if schema changed)
-  - Blocks: test-writer, pattern-enforcer
-  - Est time: 30–60 min
+## Phase 2: Parallel
 
-## Phase 3: Tests + Quality (parallel)
-
-- [ ] **test-writer agent** — pytest for [feature]
-  - Files: tests/test_[feature].py
-  - Depends on: scripts agent
+- [ ] **frontend agent** — [Feature] UI
+  - Files: templates/[feature]/, static/js/[feature]/
+  - Depends on: backend agent
   - Est time: 30 min
 
-- [ ] **pattern-enforcer agent** — Verify [script].py compliance
-  - Files: [script].py
-  - Depends on: scripts agent
-  - Est time: 15 min
+- [ ] **test-writer agent** — Test suite
+  - Files: tests/test_[feature].py
+  - Depends on: backend agent
+  - Est time: 30 min
 ```
 
 ---
 
-## Acceptance Criteria Template for rekordbox-tools (copy-paste)
+## Acceptance Criteria Template (copy-paste)
 
 ```markdown
 # Acceptance Criteria: [Feature Name]
 
 ## Functional
-- [ ] [Core behavior works as described]
+- [ ] [Core behavior works]
 - [ ] [Edge case handled]
 
-## Safety
-- [ ] --dry-run shows correct preview without modifying files
-- [ ] Backup created before any master.db write (if applicable)
-- [ ] collection.nml not modified directly (if NML write involved)
-
 ## Technical
-- [ ] Tests pass: `python3.11 -m pytest tests/ -x`
-- [ ] No regressions on existing CLI flags
-- [ ] Syntax check: `python3.11 -m py_compile [script].py`
-- [ ] SQLCipher: all 3 PRAGMAs set including legacy=4 (if SQLCipher used)
-- [ ] masterPlaylists6.xml synced if playlists changed in master.db
+- [ ] Tests pass: `[test command]`
+- [ ] Coverage: 70%+
+- [ ] No regressions
 
 ## Human Validation
-- [ ] Run --dry-run and verify output looks correct
-- [ ] Close Traktor/Rekordbox and run the actual operation
-- [ ] Verify result in Rekordbox or Traktor UI
+- [ ] [Page/flow to test]
+- [ ] Mobile layout
+- [ ] Role-specific access
 ```
 
 ---
 
-## GitHub Issue Template for rekordbox-tools (copy-paste)
+## Issue Template (copy-paste for GitHub)
 
 ```markdown
 ## Summary
 [One sentence]
 
 ## Context
-- Script(s) affected: [list]
-- High-risk files: collection.nml / master.db / exportLibrary.db (if any)
-- Constraints:
-  - Do not modify collection.nml directly (backup + write copy)
-  - Close Traktor before testing NML reads
-  - Close Rekordbox before testing master.db writes
+- Relevant files: [list]
+- Constraints: [what not to change]
 
 ## Acceptance Criteria
-- [ ] [Core behavior works]
-- [ ] --dry-run shows correct preview
-- [ ] Backup created before master.db write (if applicable)
-- [ ] Tests pass: `python3.11 -m pytest tests/ -x`
-- [ ] No regressions on existing CLI flags
-- [ ] `python3.11 -m py_compile [script].py` exits 0
+- [ ] [Specific, testable criterion]
+- [ ] Tests pass: `[test command]`
+- [ ] No regressions
 
 ## Implementation Notes
-1. Safety safeguard: [what backup/dry-run is needed]
-2. [Step-by-step approach]
+1. [Step one]
+2. [Step two]
 
 ## Out of Scope
-- [Not covered by this issue]
+- [Not covered]
 ```
 
 ---
@@ -125,8 +109,7 @@ touch ".github/prompts/issue-NNN-[title]"/{prompt,plan,agents,acceptance-criteri
 "Plan [feature] using PLANNING-WORKFLOW-GUIDE"
 "Generate agents.md from my plan using SMART-DISPATCH"
 "Orchestrate .github/prompts/issue-NNN-title/agents.md"
-"Use the scripts agent to [specific task]"
+"Use the backend agent to [specific task]"
 "Use the test-writer agent for [feature] coverage"
-"Use the pattern-enforcer to verify [script].py"
 "What's the status of issue-NNN?"
 ```

@@ -1,299 +1,184 @@
-# Script Structure Rules — rekordbox-tools (Strict Enforcement)
+# Service Layer Rules (Strict Enforcement)
 
-> These rules apply to all Python scripts in rekordbox-tools.
-> There is no service layer, no web framework, no ORM — just standalone Python scripts.
-> The equivalent of "service layer rules" for this project is script structure discipline.
+> These rules apply to all service modules and route handlers.
 
 ---
 
-## Script Architecture
+## Architecture
 
 ```
-User invokes script
-    ↓
-argparse (CLI parsing + validation)
-    ↓
-Pre-flight checks (file existence, Rekordbox/Traktor not running)
-    ↓
-Dry-run preview (if --dry-run)
-    ↓
-Backup (if writing to master.db or NML)
-    ↓
-Main operation (DB queries, XML processing, USB export)
-    ↓
-Post-operation sync (masterPlaylists6.xml if playlists changed)
-    ↓
-Summary output (counts, paths)
+Request → Route Handler → Service Function → Database
+                ↓                    ↓
+         Validates input      Business logic
+         Auth checks          DB queries
+         Returns response     Returns data
 ```
+
+**Route handlers** are thin dispatchers:
+1. Check authentication (via decorators)
+2. Extract and validate input (via validation schemas)
+3. Call a service function
+4. Return a response (via response helpers)
+
+**Service functions** contain business logic:
+1. Perform database queries
+2. Apply business rules and validation
+3. Trigger side effects (emails, notifications, events)
+4. Return plain Python objects (dicts, model instances, lists)
 
 ---
 
-## Mandatory Script Elements
+## What Goes in Services
 
-### 1. Module Docstring
+✅ **Business logic** — calculations, decisions, state transitions
+✅ **Database queries** — reads and writes
+✅ **Cross-model operations** — operations involving multiple models
+✅ **External service calls** — email, notifications, APIs
+✅ **Complex validation** — business rules beyond basic type checking
 
-Every script must have a module-level docstring with purpose and usage:
+## What Goes in Routes
+
+✅ **Authentication check** — is the user logged in?
+✅ **Authorization check** — does the user have permission?
+✅ **Input parsing** — extract and validate request data
+✅ **Call service** — one function call to the service layer
+✅ **Return response** — format and return the result
+
+---
+
+## Service Function Rules
+
+### Do
 
 ```python
-"""
-rebuild_rekordbox_playlists.py — Wipe and rebuild all playlists in master.db.
+# ✅ Services receive plain Python parameters
+def create_item(name: str, category: str, owner_id: int) -> Item:
+    """Create a new item."""
+    item = Item(name=name, category=category, owner_id=owner_id)
+    db.session.add(item)
+    db.session.commit()
+    return item
 
-Reads playlist structure from collection.nml, then:
-1. Backs up master.db
-2. Deletes all playlists from djmdPlaylist
-3. Rebuilds playlist hierarchy from NML
-4. Regenerates masterPlaylists6.xml
-
-Usage:
-    python3.11 rebuild_rekordbox_playlists.py [--dry-run] [--nml PATH]
-
-IMPORTANT:
-    Close Traktor before running (NML lock).
-    Close Rekordbox before running (master.db lock).
-"""
+# ✅ Services return plain objects
+def get_dashboard_stats() -> dict:
+    """Compute dashboard statistics."""
+    return {
+        "total_items": Item.query.count(),
+        "active_items": Item.query.filter(Item.is_active == True).count(),
+    }
 ```
 
-### 2. argparse with --dry-run
-
-Every script that writes anything must support `--dry-run`:
+### Don't
 
 ```python
-def main():
-    parser = argparse.ArgumentParser(
-        description="Rebuild all playlists in Rekordbox master.db from Traktor NML."
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would change without modifying any files or databases"
-    )
-    parser.add_argument(
-        "--nml",
-        type=Path,
-        default=TRAKTOR_NML,
-        help=f"Path to collection.nml (default: {TRAKTOR_NML})"
-    )
-    args = parser.parse_args()
-    run(nml_path=args.nml, dry_run=args.dry_run)
-```
+# ❌ Services must NOT import request/session/HTTP objects
+from [your_framework] import request, session  # FORBIDDEN in services
 
-### 3. Pre-flight Checks
+# ❌ Services must NOT return HTTP responses
+def bad_service():
+    return json_response({"data": ...}), 200  # WRONG — route's job
 
-```python
-def check_prereqs(nml_path: Path, db_path: Path):
-    """Check prerequisites before running. Raises SystemExit if not met."""
-    if not nml_path.exists():
-        print(f"❌ NML not found: {nml_path}", file=sys.stderr)
-        sys.exit(1)
-    if not db_path.exists():
-        print(f"❌ master.db not found: {db_path}", file=sys.stderr)
-        sys.exit(1)
-```
-
-### 4. Backup Before Write
-
-```python
-def run(nml_path: Path, dry_run: bool):
-    check_prereqs(nml_path, MASTER_DB)
-
-    if not dry_run:
-        backup_master_db(MASTER_DB)
-
-    # ... main logic
-```
-
-### 5. Dry-Run Output Format
-
-Dry-run output must be consistent and clearly labeled:
-
-```python
-if dry_run:
-    print("[dry-run] No files will be modified.")
-    print(f"[dry-run] Would read playlists from: {nml_path}")
-    print(f"[dry-run] Would delete N playlists from master.db")
-    print(f"[dry-run] Would insert M playlists into master.db")
-    print(f"[dry-run] Would update: {PLAYLISTS_XML}")
-    return
-```
-
-### 6. Progress Reporting with tqdm
-
-For operations over ~100 tracks, use `tqdm`:
-
-```python
-from tqdm import tqdm
-
-for track in tqdm(tracks, desc="Inserting tracks", unit="track"):
-    insert_track(con, track)
-```
-
-### 7. Summary Output
-
-End every script with a summary of what was done:
-
-```python
-print(f"\n✅ Complete:")
-print(f"   Playlists deleted:  {deleted_count}")
-print(f"   Playlists inserted: {inserted_count}")
-print(f"   Tracks processed:   {track_count}")
-print(f"   XML updated:        {PLAYLISTS_XML}")
+# ❌ Services must NOT handle HTTP concerns
+def bad_service():
+    if not request.form.get('name'):  # WRONG — validation is route's job
+        abort(400)
 ```
 
 ---
 
-## What Goes in a Script vs. What Goes in a Shared Utility
+## Route Handler Pattern
 
-| Logic | Location |
-|-------|----------|
-| SQLCipher connection setup | `utils/db.py` (shared) or script-level constant |
-| File path constants | Module-level constants in each script (or `utils/paths.py`) |
-| Backup functions | `utils/backup.py` (shared) or defined once per script |
-| argparse setup | Always in `main()` of each script |
-| Business logic (DB queries, XML transforms) | In the script's own functions |
-| NML parsing | Script-level functions (or shared util if used in 3+ scripts) |
-
----
-
-## Function Design Rules
-
-### Functions receive plain parameters — not argparse Namespace
+<!-- CUSTOMIZE: Replace decorators and response helpers with your framework's equivalents -->
 
 ```python
-# ✅ CORRECT — testable without argparse
-def rebuild_playlists(nml_path: Path, dry_run: bool = False) -> int:
-    """Rebuild all playlists from NML. Returns count of playlists inserted."""
-    ...
-
-# ❌ WRONG — untestable (args is an argparse Namespace)
-def rebuild_playlists(args):
-    nml_path = args.nml
-    dry_run = args.dry_run
-    ...
-```
-
-### Functions return plain values
-
-```python
-# ✅ CORRECT — returns count (testable)
-def insert_playlists(con, playlists: list[dict]) -> int:
-    """Insert playlists into djmdPlaylist. Returns count inserted."""
-    count = 0
-    for pl in playlists:
-        con.execute("INSERT INTO djmdPlaylist ...", ...)
-        count += 1
-    return count
-
-# ❌ WRONG — prints and returns nothing (untestable)
-def insert_playlists(con, playlists):
-    for pl in playlists:
-        con.execute(...)
-    print("Done")
-```
-
-### Functions are focused on one concern
-
-```python
-# ✅ CORRECT — one function, one job
-def parse_nml_playlists(nml_path: Path) -> list[dict]:
-    """Parse playlist structure from NML. Returns list of playlist dicts."""
-    ...
-
-def build_playlist_tree(playlists: list[dict]) -> dict:
-    """Build nested playlist tree from flat list."""
-    ...
-
-def write_playlists_to_db(con, tree: dict, dry_run: bool = False) -> int:
-    """Write playlist tree to master.db. Returns count written."""
-    ...
-```
-
----
-
-## Error Handling Pattern
-
-```python
-def run(nml_path: Path, dry_run: bool):
-    """Main run function — orchestrates the full operation."""
-    check_prereqs(nml_path, MASTER_DB)
-
-    if dry_run:
-        print(f"[dry-run] Would process: {nml_path}")
-        return
-
-    backup_master_db(MASTER_DB)
-
-    con = None
+@bp.route('/api/items', methods=['POST'])
+@login_required
+@validate_request(CreateItemSchema)
+def create_item(validated_data):
+    """Create a new item."""
     try:
-        con = open_rekordbox_db(MASTER_DB, readonly=False)
-        result = do_the_work(con, nml_path)
-        con.commit()
-        print(f"✅ Done: {result} items processed")
-    except KeyboardInterrupt:
-        print("\n⚠️  Interrupted. Rolling back...", file=sys.stderr)
-        if con:
-            con.rollback()
-        sys.exit(1)
+        item = item_service.create_item(**validated_data)
+        return created_response(data={"id": item.id, "name": item.name})
+    except ValueError as e:
+        return error_response(str(e), 400)
     except Exception as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
-        if con:
-            con.rollback()
-        sys.exit(1)
-    finally:
-        if con:
-            con.close()
+        db.session.rollback()
+        return error_response(str(e), 500)
 ```
 
 ---
 
-## Import Order
+## Error Handling in Services
+
+Services raise exceptions or return None; routes handle the HTTP response:
 
 ```python
-# 1. Standard library
-import argparse
-import sys
-import shutil
-from datetime import datetime
-from pathlib import Path
-import xml.etree.ElementTree as ET
-import sqlite3
+# Service — raises or returns None
+def delete_item(item_id: int, user_id: int) -> bool:
+    item = db.session.get(Item, item_id)
+    if item is None:
+        return False
+    if item.owner_id != user_id:
+        raise PermissionError("Cannot delete another user's item")
+    db.session.delete(item)
+    db.session.commit()
+    return True
 
-# 2. Third-party
-import sqlcipher3
-from tqdm import tqdm
-import questionary
-
-# 3. Local (if utils/ exists)
-from utils.db import open_rekordbox_db, SQLCIPHER_KEY
-from utils.backup import backup_master_db
-from utils.paths import MASTER_DB, PLAYLISTS_XML, TRAKTOR_NML
+# Route — converts to HTTP
+@bp.route('/api/items/<int:item_id>', methods=['DELETE'])
+@login_required
+def delete_item(item_id: int):
+    """Delete an item."""
+    try:
+        deleted = item_service.delete_item(item_id, current_user.id)
+    except PermissionError as e:
+        return error_response(str(e), 403)
+    if not deleted:
+        return error_response("Not found", 404)
+    return deleted_response()
 ```
 
 ---
 
-## File Path Constants
+## Service File Organization
 
-Define as module-level Path constants — never hardcoded inline:
+<!-- CUSTOMIZE: Replace with your project's service file names -->
+
+```
+services/
+├── __init__.py
+├── auth_service.py       # Login, registration, password reset
+├── user_service.py       # User CRUD, profile management
+├── item_service.py       # Item CRUD and business rules
+└── [feature]_service.py  # One service per domain
+```
+
+---
+
+## Testing Services
+
+Services are testable **without** the HTTP test client:
 
 ```python
-from pathlib import Path
-
-MASTER_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
-PLAYLISTS_XML = Path.home() / "Library/Pioneer/rekordbox/masterPlaylists6.xml"
-TRAKTOR_NML = Path.home() / "Documents/Native Instruments/Traktor 3.11.1/collection.nml"
-FINGERPRINTS_DB = Path(__file__).parent / "fingerprints.db"
+def test_create_item(app):
+    """Test item creation via service layer."""
+    with app.app_context():
+        item = item_service.create_item(
+            name="Test Item",
+            category="General",
+            owner_id=1
+        )
+        assert item.id is not None
+        assert item.name == "Test Item"
 ```
+
+This is faster and more focused than testing via HTTP routes.
 
 ---
 
-## Quality Checklist
+## When to Create a Service
 
-Before submitting any script change:
-- [ ] Module-level docstring with purpose and usage
-- [ ] `--dry-run` supported and clearly labelled in output
-- [ ] Backup called before any `master.db` write
-- [ ] Functions take plain parameters (not argparse Namespace)
-- [ ] Functions return values (not just print)
-- [ ] `tqdm` used for loops over >100 items
-- [ ] Summary output at the end
-- [ ] Syntax check: `python3.11 -m py_compile [script].py`
-- [ ] `python3.11 [script].py --help` works correctly
+- **Create a service** when route handlers exceed ~50 lines of business logic
+- **Create a service** when the same logic is called from multiple routes
+- **Don't create a service** for trivial CRUD with no business rules
+- **Don't create a service** for one-off admin operations
