@@ -19,7 +19,6 @@ Use this agent when you have a **widespread, mechanical change** to make:
 - Standardize import paths
 - Fix a repeating anti-pattern
 - Enforce a new convention retroactively
-- Consolidate duplicate utilities into a single canonical source
 
 ---
 
@@ -37,156 +36,25 @@ Each session is one campaign. A campaign = one pattern = one PR.
 **Scope:** [which files/directories]
 **Count:** [how many instances exist]
 **Risk:** [Low / Medium / High]
-**Human review required:** [Yes / No]
 ```
 
----
-
-## Common Campaign Types
-
-<!-- CUSTOMIZE: Replace these examples with your project's actual patterns to fix -->
-
-### Type 1: Deprecated API Call Replacement
+### Example Campaign: Deprecated Query Pattern
 
 ```markdown
-## Campaign: Replace deprecated query calls
+## Campaign A: Replace deprecated .query.get() calls
 
 Pattern to eliminate: Model.query.get(id)
 Replacement: db.session.get(Model, id)
-Scope: [your source directory] (all code files)
-Count: [N] instances (run grep to count)
+Scope: app/ (all Python files)
+Count: ~197 instances
 Risk: Low (mechanical substitution, behavior identical)
+
+Steps:
+1. Search: grep -r "\.query\.get(" app/
+2. Replace each instance
+3. Run tests after each file
+4. Never change other code in the same commit
 ```
-
-**Replacement rules:**
-```python
-# Pattern 1: simple lookup
-obj = db.session.get(Model, obj_id)       # was: Model.query.get(obj_id)
-
-# Pattern 2: get or 404
-obj = db.session.get(Model, obj_id)       # was: Model.query.get_or_404(obj_id)
-if obj is None:
-    abort(404)
-```
-
-**Do NOT change:** Filter queries, chained queries, or anything beyond the target pattern.
-
-### Type 2: Import Path Consolidation
-
-```markdown
-## Campaign: Consolidate auth decorator imports
-
-Pattern to eliminate: Importing [decorator] from multiple locations
-Replacement: Single canonical import source
-Scope: All route files
-Risk: Medium (verify redirect vs 401 behavior matches)
-```
-
-**Steps:**
-1. Find all files importing the decorator from the wrong source
-2. Change each import to the canonical source
-3. Remove the duplicate from the old source
-4. Verify re-exports if any `__init__.py` files re-export the decorator
-
-### Type 3: CSRF / Security Cleanup
-
-```markdown
-## Campaign: CSRF exemption cleanup
-
-Pattern to eliminate: Blanket CSRF exemptions on entire modules
-Replacement: Per-route exemptions only where needed
-Risk: High (human review required)
-```
-
-**Steps:**
-1. **Audit first — do not change anything yet.** Classify every POST route:
-   - `form` — HTML form submissions (needs CSRF)
-   - `ajax` — JSON API calls (needs CSRF via header)
-   - `token` — token-authenticated (no session, no CSRF needed)
-2. Present audit to user for review
-3. Only proceed after explicit approval
-
-### Type 4: Response Format Standardization
-
-```markdown
-## Campaign: Standardize API response format
-
-Pattern to eliminate: Raw response construction (e.g., jsonify)
-Replacement: Standardized response helpers
-Scope: All route files
-Risk: Low
-```
-
----
-
-## Process Rules (All Campaigns)
-
-1. **One pattern, one session.** Never mix Campaign A with B or C.
-2. **One file per commit.** Never batch multiple files.
-3. **Run tests after every file.** If a file's tests fail, skip that file and
-   document why. Move to the next file.
-4. **Never change behavior.** If the replacement changes what the code does (not just
-   how it's written), stop and flag it.
-5. **Keep a log.** At the end of a session, output:
-   - Files changed: N
-   - Files skipped (with reason): N
-   - Remaining occurrences: N
-   - Test command to verify: `grep -rn "<pattern>" [source directory]/`
-
----
-
-## Campaign Workflow
-
-```
-1. DEFINE: Identify pattern, count instances, assess risk
-2. AUDIT: Generate complete list of files to change
-3. PLAN: Order files by risk (least risky first)
-4. EXECUTE:
-   For each file:
-   a. Read the file
-   b. Find all instances of the target pattern
-   c. Replace mechanically
-   d. Ensure required imports are present
-   e. Run tests for the affected feature
-   f. If tests pass → commit, move to next file
-   g. If tests FAIL → revert all changes in that file, log failure, skip to next
-5. VERIFY: Run full test suite after all files changed
-6. REPORT: Count replaced, files changed, files skipped, test results
-```
-
-**Verification command** (run when done with all files):
-```bash
-grep -rn "[old pattern]" [source directory]/ --include="*.[ext]"
-```
-The result should be empty when the campaign is complete.
-
----
-
-## Commit Message Convention
-
-Each commit covers one file:
-
-```
-refactor: replace [pattern] in [filename]
-
-Replaced N instances of [old pattern] with [new pattern].
-No behavior changes.
-
-Pattern campaign: [Campaign Name]
-```
-
----
-
-## Risk Assessment
-
-| Risk Level | Criteria | Extra Precautions |
-|------------|----------|-------------------|
-| **Low** | Mechanical 1:1 substitution, no logic change | Standard testing |
-| **Medium** | Slight behavioral nuance, e.g. null handling, import side effects | Test edge cases explicitly |
-| **High** | Auth, security, or CSRF related | Human review required before each file |
-
-High-risk campaigns require human approval before proceeding. Present the audit
-classification to the user first.
 
 ---
 
@@ -195,9 +63,9 @@ classification to the user first.
 ### One Pattern Per Session
 
 ```
-✅ Session: Replace all deprecated query calls
-✅ Session: Standardize response helpers
-✅ Session: Consolidate duplicate decorators
+✅ Session: Replace all Model.query.get() → db.session.get()
+✅ Session: Standardize response helpers (jsonify → success_response)
+✅ Session: Add missing auth decorators
 
 ❌ Session: Do 3 different pattern fixes at once
 ```
@@ -206,8 +74,7 @@ classification to the user first.
 
 ```bash
 # After changing each file:
-# CUSTOMIZE: Replace with your test command
-[TEST_COMMAND] tests/test_[affected_feature].py -x --tb=short -q
+[TEST_COMMAND] tests/test_[affected_feature].py -x
 
 # Never batch multiple files before testing
 ```
@@ -232,6 +99,72 @@ user = db.session.get(User, user_id)  # inline comment stays
 # Removed comment
 user = db.session.get(User, user_id)
 ```
+
+---
+
+## Campaign Workflow
+
+```
+1. DEFINE: Identify pattern, count instances, assess risk
+2. AUDIT: Generate complete list of files to change
+3. PLAN: Order files by risk (least risky first)
+4. EXECUTE:
+   For each file:
+   a. Read the file
+   b. Find all instances
+   c. Replace mechanically
+   d. Run tests
+   e. Commit with: "refactor: replace [pattern] in [file]"
+5. VERIFY: Run full test suite after all files changed
+6. REPORT: Count replaced, files changed, test results
+```
+
+---
+
+## Commit Message Convention
+
+Each commit covers one file:
+
+```
+refactor: replace [pattern] in [filename]
+
+Replaced N instances of [old pattern] with [new pattern].
+No behavior changes.
+
+Pattern campaign: [Campaign Name]
+```
+
+---
+
+## Example: Standardizing Response Format
+
+```python
+# Campaign: Replace raw jsonify() with response helpers
+# Scope: app/routes/ (all .py files)
+# Count: ~43 instances
+# Risk: Low
+
+# Pattern to eliminate:
+return jsonify({"success": True, "data": result}), 200
+return jsonify({"success": False, "error": msg}), 404
+
+# Replacement:
+from ..utils.api_response import success_response, error_response
+return success_response(data=result)
+return error_response(msg, 404)
+```
+
+---
+
+## Risk Assessment
+
+| Risk Level | Criteria | Extra Precautions |
+|------------|----------|-------------------|
+| **Low** | Mechanical 1:1 substitution, no logic change | Standard testing |
+| **Medium** | Slight behavioral nuance, e.g. null handling | Test edge cases explicitly |
+| **High** | Auth or security related | Human review required |
+
+High-risk campaigns require human approval before each file change.
 
 ---
 

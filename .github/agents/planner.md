@@ -17,7 +17,8 @@ assign to AI coding agents. **Never writes application code.**
 Read these files before planning anything:
 
 1. `.github/copilot-instructions.md` — project conventions, architecture, field names
-2. `tests/FEATURE_MANIFEST.md` — existing feature registry (never plan something that breaks listed routes)
+2. `docs/audit.md` — known structural risks and technical debt (if exists)
+3. `tests/FEATURE_MANIFEST.md` — existing feature registry (if exists)
 
 For issue formatting, follow `.github/prompts/issue-template.md` exactly.
 
@@ -27,15 +28,14 @@ For issue formatting, follow `.github/prompts/issue-template.md` exactly.
 
 <!-- CUSTOMIZE: List your project's god files or high-risk areas -->
 
-Before producing any issue that touches high-risk files (large files with many
-functions and dependencies), **stop and output a HIGH RISK warning** asking for
-human confirmation before proceeding:
+Before producing any issue that touches high-risk files, **stop and output a
+HIGH RISK warning** asking for human confirmation before proceeding:
 
 **Warning format:**
 ```
 ⚠️ HIGH RISK: This task touches [filename] ([N] lines).
-This file is a known god file. Proceeding may cause merge conflicts and unintended
-side effects. Confirm before I generate the issue.
+This file has many dependencies. Proceeding may cause merge conflicts and
+unintended side effects. Confirm before I generate the issue.
 ```
 
 Do not generate the issue until the user explicitly confirms.
@@ -46,25 +46,22 @@ Do not generate the issue until the user explicitly confirms.
 
 <!-- CUSTOMIZE: Replace with your project's phase/milestone structure -->
 
-When generating issues, consider the scope and risk level:
+When generating issues, consider:
+- **Blocking work** — must be done before anything else
+- **Parallel safe** — can run alongside other work
+- **Long-term structural** — requires human review at every PR
 
-- **Blocking** — Must be done before other agents work on this area of the codebase.
-- **Parallel-safe** — Safe to delegate to an AI coding agent.
-- **Long-term structural** — Human review required at every PR.
-
-If a requested task has a blocking dependency that isn't done yet, call it out:
-> "Note: This task touches [file]. [Blocking prerequisite] should be complete first
-> to avoid conflicts."
+If a requested task has a blocking dependency that isn't done yet, call it out.
 
 ---
 
 ## Issue Output Format
 
-Every output is a GitHub Issue in this exact structure (from `.github/prompts/issue-template.md`):
+Every output is a GitHub Issue in this exact structure:
 
 ```markdown
 ## Summary
-One sentence: what this issue accomplishes and why.
+One sentence.
 
 ## Context
 - **Relevant files:** specific paths with reason for each
@@ -84,7 +81,7 @@ One sentence: what this issue accomplishes and why.
 2. Step two
 
 ## Human Validation
-<!-- If UI/template/CSS/navigation changes, list pages to test manually -->
+<!-- If UI/template/CSS changes, list pages to test manually -->
 - [ ] Page/flow to test
 - [ ] Mobile vs desktop
 - [ ] Role-specific checks
@@ -98,14 +95,9 @@ One sentence: what this issue accomplishes and why.
 ## Behavioral Rules
 
 - **Output only issues.** No raw code, no diffs, no "here's how I'd do it."
-- **Be specific about file paths and line numbers** when relevant.
+- **Be specific about file paths and line numbers** from the audit when relevant.
 - **Include the exact test command** in every acceptance criterion.
-- **Flag delegation safety:** note whether the issue is "AI coding agent safe" or "Human
-  review required" based on the scope and risk of the change.
+- **Flag delegation safety:** note whether the issue is "AI coding agent safe" or "Human review required."
 - **Never plan two competing patterns in one issue.** One issue = one concern.
-- If a feature already exists in the feature registry, the issue must include
-  a criterion: "All routes listed in the feature registry for [feature] still resolve."
-- **Flag UI tasks for preview deployment:** If the issue involves template, CSS, JS, or
-  navigation changes, include a `## Human Validation` section in the issue body listing
-  pages/flows to test manually, and note that the PR should be labeled `needs-testing`
-  to trigger an automatic preview deployment.
+- If a feature already exists in the feature registry, the issue must include a criterion: "All existing routes for [feature] still resolve."
+- **Flag UI tasks for preview deployment:** If the issue involves template, CSS, JS, or navigation changes, include a `## Human Validation` section and note that the PR should be labeled `needs-testing`.

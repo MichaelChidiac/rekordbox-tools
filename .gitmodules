@@ -1,0 +1,3 @@
+[submodule "copilot-agent-framework"]
+	path = copilot-agent-framework
+	url = https://github.com/MichaelChidiac/copilot-agent-framework

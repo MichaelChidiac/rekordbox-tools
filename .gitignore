@@ -12,6 +12,9 @@ collection.nml.backup*
 # User config (pinned playlists)
 sync_config.json
 
+# Framework sync cache (local — tracks last synced submodule SHA)
+.framework-sha
+
 # Python cache
 __pycache__/
 *.pyc

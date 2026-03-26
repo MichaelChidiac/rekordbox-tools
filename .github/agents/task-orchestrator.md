@@ -72,7 +72,6 @@ Parse agents.md and determine:
 4. **Execution sequence** — sequential steps and parallel groups
 
 **Example output:**
-
 ```
 EXECUTION PLAN
 ==============
@@ -80,14 +79,11 @@ EXECUTION PLAN
 Phase 1 (Sequential - blocks Phase 2):
   Step 1.1: migration agent (15 min)
   Step 1.2: backend agent [depends on 1.1] (45 min)
-  
+
 Phase 2 (Parallel - blocks Phase 3):
   Step 2.1: frontend agent [depends on 1.2] (30 min) ──┐
   Step 2.2: test-writer agent [depends on 1.2] (30 min) ├─ parallel
   Step 2.3: [other agent] [depends on 1.2] (20 min) ────┘
-  
-Phase 3 (Conditional):
-  Step 3.1: refactor agent [optional, depends on 2.1] (20 min)
 
 Estimated total time: 1h 35m
 Parallelization saves: ~30 minutes (without parallel: 2h 5m)
@@ -98,34 +94,21 @@ Parallelization saves: ~30 minutes (without parallel: 2h 5m)
 Insert all tasks into the `todos` table with dependency metadata:
 
 ```sql
--- Create todos for Phase 1
-INSERT INTO todos (id, title, description, status, created_at) VALUES
-  ('issue-NNN-phase1-migration', 
-   'Migration: Add [feature] schema', 
+INSERT INTO todos (id, title, description, status) VALUES
+  ('issue-NNN-phase1-migration',
+   'Migration: Add [feature] schema',
    'Agent: migration\nBlocks: phase1-backend',
-   'pending', 
-   datetime('now'));
+   'pending');
 
-INSERT INTO todos (id, title, description, status, created_at) VALUES
-  ('issue-NNN-phase1-backend', 
-   'Backend: [Feature]Service + routes', 
-   'Files: [service file], [routes file]\nAgent: backend\nDepends: phase1-migration',
-   'pending', 
-   datetime('now'));
+INSERT INTO todos (id, title, description, status) VALUES
+  ('issue-NNN-phase1-backend',
+   'Backend: [Feature]Service + routes',
+   'Agent: backend\nDepends: phase1-migration',
+   'pending');
 
--- Add dependencies
+-- Dependencies
 INSERT INTO todo_deps (todo_id, depends_on) VALUES
   ('issue-NNN-phase1-backend', 'issue-NNN-phase1-migration');
-
--- Create todos for Phase 2 (parallel)
-INSERT INTO todos (id, title, description, status, created_at) VALUES
-  ('issue-NNN-phase2-frontend', 'Frontend: [Feature] UI', '...', 'pending', datetime('now')),
-  ('issue-NNN-phase2-tests', 'Tests: [Feature] service + routes', '...', 'pending', datetime('now'));
-
--- Phase 2 depends on Phase 1 backend
-INSERT INTO todo_deps (todo_id, depends_on) VALUES
-  ('issue-NNN-phase2-frontend', 'issue-NNN-phase1-backend'),
-  ('issue-NNN-phase2-tests', 'issue-NNN-phase1-backend');
 ```
 
 ### Step 4: Dispatch Phase 1 (Sequential)
@@ -133,103 +116,55 @@ INSERT INTO todo_deps (todo_id, depends_on) VALUES
 For each agent in Phase 1, in order:
 
 1. **Update status:** `UPDATE todos SET status = 'in_progress' WHERE id = '...'`
-2. **Dispatch agent** with full context:
-   ```
-   Use the [agent] agent to [task description].
-   
-   Context: This is Phase 1 Step N of issue-NNN-title.
-   All files/acceptance criteria in .github/prompts/issue-NNN-title/[task-file].md
-   ```
-3. **Wait for completion** (you'll be notified when agent finishes)
+2. **Dispatch agent** with full context (phase, files, acceptance criteria)
+3. **Wait for completion** (you'll be notified)
 4. **Update status:** `UPDATE todos SET status = 'done' WHERE id = '...'`
-5. **Check for errors:** If agent failed, `UPDATE status = 'blocked'` and report
-
-**Status values in todos:**
-- `pending` — waiting to start
-- `in_progress` — agent currently working
-- `done` — agent completed successfully
-- `blocked` — agent hit a blocker, can't proceed
+5. **Check for errors:** If failed, `UPDATE status = 'blocked'` and report
 
 ### Step 5: Dispatch Phase 2 (Parallel)
 
 Once Phase 1 is complete:
 
-1. **Check dependency:** Verify Phase 1 is `done`
-2. **Dispatch all Phase 2 agents simultaneously:**
-   ```
-   [Launch N agents in parallel]
-   
-   Agent 1 (frontend): Create [Feature] UI
-   Agent 2 (test-writer): Write test suite
-   
-   All depend on issue-NNN-phase1-backend (now complete).
-   Work in parallel; I'll collect results when all finish.
-   ```
-3. **Track in SQL:** Update status to `in_progress` for all
-4. **Monitor progress:** Check todos table periodically
-5. **Wait for all to complete:** All must show `done`
-6. **Update SQL:** `UPDATE todos SET status = 'done' WHERE...`
+1. **Verify:** Phase 1 is `done`
+2. **Dispatch all Phase 2 agents simultaneously**
+3. **Track in SQL:** All three set to `in_progress`
+4. **Wait for all to complete**
+5. **Update SQL:** All set to `done`
 
-### Step 6: Dispatch Phase 3+ (Conditional)
-
-If subsequent phases are optional or conditional:
-
-1. **Check:** Are previous phase tasks complete?
-2. **Ask:** "Should I run optional [agent]?" (if applicable)
-3. **If yes:** Dispatch like previous phases
-4. **If no:** Mark as `blocked` with reason "skipped per user request"
-
-### Step 7: Run Quality Gates
+### Step 6: Run Quality Gates
 
 After each phase:
 - Run the gates defined in `.github/skills/QUALITY-GATES.md`
 - BLOCK failures: halt orchestrator, report to user
 - WARN failures: log but continue
 
-### Step 8: Final Report
-
-Generate a completion report:
+### Step 7: Final Report
 
 ```
 ORCHESTRATION COMPLETE
 ======================
 
-Issue: #NNN — [Feature Name]
-
 Phase 1: ✅ Complete (2/2 agents done)
   ✅ migration agent — 14 min
   ✅ backend agent — 42 min
-  Total: 56 minutes
 
-Phase 2: ✅ Complete (2/2 agents done)
+Phase 2: ✅ Complete (3/3 agents done)
   ✅ frontend agent — 28 min
   ✅ test-writer agent — 31 min
-  Total: 31 minutes (parallel: saved 28 min!)
-
-Phase 3: ⏭️  Skipped (optional refactor)
+  ✅ [other] agent — 19 min
+  (parallel: saved ~40 min!)
 
 SUMMARY
 -------
-Total agents dispatched: 4
-Total agents done: 4
-Total agents blocked: 0
-Estimated runtime: 1h 55m
-Actual runtime: 1h 27m (28 min faster!)
-Parallelization savings: 28 minutes
+Total agents dispatched: 5
+Total agents done: 5
+Parallelization savings: 40 minutes
 
 NEXT STEPS
 ----------
-1. Collect results from all agents
-2. Review git changes: `git diff origin/main...HEAD`
-3. Run full test suite
-4. Commit as atomic PR
-5. Merge to staging
-
-Agent Results:
-- issue-NNN-phase1-migration: ✅ See commit [hash]
-- issue-NNN-phase1-backend: ✅ See commit [hash]
-- issue-NNN-phase2-frontend: ✅ See commit [hash]
-- issue-NNN-phase2-tests: ✅ See commit [hash]
+1. Review git changes: git diff origin/main...HEAD
+2. Run full test suite
+3. Create PR
 ```
 
 ---
@@ -240,112 +175,31 @@ Agent Results:
 ```
 ERROR: Invalid agents.md
   Reason: Circular dependency detected
-    → backend depends on frontend
-    → frontend depends on backend
-  
-  Action: FIX agents.md and re-run.
+  Action: Fix agents.md and re-run.
 ```
 
-**If an agent fails during execution:**
+**If an agent fails:**
 ```
 ERROR: [Agent] failed
   Status: blocked (phase incomplete)
-  
-  Action: 
+  Action:
   1. Fix the agent's code
-  2. Re-dispatch: Re-run [agent] agent
-  3. Or skip and continue: UPDATE todos SET status = 'blocked' WHERE id = '...'
-```
-
-**If dependencies are unfulfilled:**
-```
-ERROR: Phase 2 agents can't launch
-  Reason: Phase 1 backend agent still 'pending'
-  
-  Action: 
-  1. Wait for Phase 1 to complete
-  2. Or force-skip: UPDATE todos SET status = 'done' WHERE id = '...'
+  2. Re-dispatch the agent
+  3. Or skip: UPDATE todos SET status = 'blocked' WHERE id = '...'
 ```
 
 ---
 
 ## Quality Checklist
 
-Before marking orchestration as complete, verify:
+Before marking orchestration complete:
 
-- [ ] All phases executed in correct order (no premature launches)
-- [ ] Sequential phases waited for previous phase to complete
+- [ ] All phases executed in correct order
+- [ ] Sequential phases waited for previous phase
 - [ ] Parallel agents launched simultaneously
-- [ ] All agents marked `done` or `blocked` in SQL todos
-- [ ] No circular dependencies detected
-- [ ] Error handling: any failed agents marked `blocked` with reason
-- [ ] Final report includes timing and parallelization savings
-- [ ] All agent results collected and reviewed
+- [ ] All agents marked `done` or `blocked` in SQL
+- [ ] No circular dependencies
+- [ ] Failed agents documented with reason
+- [ ] Final report includes timing and savings
 - [ ] Tests pass
-- [ ] No conflicts in git diff
-
----
-
-## Example: Full Orchestration
-
-Given this `agents.md`:
-
-```markdown
-# Agent Dispatch Plan
-
-## Phase 1: Database + Backend
-
-- [ ] **migration agent** — Add new models and schema
-- [ ] **backend agent** — Service layer + routes
-
-## Phase 2: UI + Tests (parallel)
-
-- [ ] **frontend agent** — Feature UI
-- [ ] **test-writer agent** — Test suite
-```
-
-**Orchestrator would execute:**
-
-```
-STEP 1: Validate agents.md
-  ✓ File found: .github/prompts/issue-NNN-title/agents.md
-  ✓ Format valid (markdown)
-  ✓ No cycles detected
-  ✓ Agent names valid
-
-STEP 2: Build execution plan
-  Phase 1 (Sequential):
-    Step 1.1 → migration agent
-    Step 1.2 → backend agent [depends on 1.1]
-  
-  Phase 2 (Parallel):
-    Step 2.1 → frontend agent [depends on 1.2] ──┐
-    Step 2.2 → test-writer agent [depends on 1.2] ┤ parallel
-                                                    └─ wait for both
-
-STEP 3: Create SQL todos
-  INSERT 4 todos, 3 dependencies
-
-STEP 4: Dispatch Phase 1
-  [1/4] Dispatching migration agent...
-  ⏳ Waiting for migration agent to complete
-  ✅ Migration agent done (commit: [hash])
-  
-  [2/4] Dispatching backend agent...
-  ⏳ Waiting for backend agent to complete
-  ✅ Backend agent done (commit: [hash])
-  Phase 1 complete. Proceeding to Phase 2.
-
-STEP 5: Dispatch Phase 2 (parallel)
-  [3/4] Dispatching frontend agent...
-  [4/4] Dispatching test-writer agent...
-  ⏳ Waiting for both to complete...
-  ✅ Frontend agent done (commit: [hash])
-  ✅ Test-writer agent done (commit: [hash])
-  Phase 2 complete.
-
-STEP 6: Report
-  ✅ All 4 agents complete
-  Parallelization saved ~30 minutes
-  See full report above.
-```
+- [ ] No git conflicts

@@ -1,278 +1,204 @@
-# Plan-to-Tasks Skill
+# plan-to-tasks.md — Plan Decomposition Skill
 
-> Reusable skill for decomposing design documents or plans into actionable, agent-ready task files.
+## Purpose
 
-## What It Does
-
-Transforms a design plan into a structured set of task files that:
-- Can be assigned to AI agents (Copilot/Claude) one by one
-- Have clear dependencies and execution order
-- Contain acceptance criteria (testable)
-- Include real, copy-pasteable code snippets
-- Map 1:1 to sections of the design document
+Convert a design document or plan into a concrete, parallelized set of agent tasks
+with `agents.md` ready for the task-orchestrator.
 
 ## When to Use
 
-**Call this skill whenever you need to break down:**
-- A design document into implementation tasks
-- An epic into story-sized work items
-- A feature plan into specific, assignable tasks
-- A large refactor into smaller, independent chunks
+- You have a plan.md with architecture and task descriptions
+- You want to identify which parts can run in parallel
+- You need a structured agents.md for the orchestrator
 
 **Trigger phrases:**
-- "Break this into tasks"
-- "Create task files from this plan"
-- "Generate Copilot issues from this design"
-- "Decompose this into actionable items"
-- "Plan-to-tasks skill"
+- "Break this plan into tasks"
+- "Decompose plan.md into agents.md"
+- "Create the parallelization plan for this feature"
 
-## How to Invoke
+---
 
+## Step 1: Parse the Plan
+
+Read plan.md and extract:
+- [ ] Feature title and description
+- [ ] Required changes (schema/DB, backend, frontend, tests, mobile)
+- [ ] Constraints (what must be done first, what can run in parallel)
+- [ ] Complexity estimate (1-10)
+
+**Output:**
 ```
-Claude: Read my design doc and turn it into a task breakdown.
-
-Design doc: [paste design-my-feature.md here]
-
-Use the plan-to-tasks skill to create task files.
-```
-
-Or reference existing design docs:
-
-```
-Claude: Apply the plan-to-tasks skill to docs/design-my-feature.md
-```
-
-## Execution Process
-
-### Step 1: Read & Analyze
-
-- [ ] Read the design document completely
-- [ ] Identify every discrete unit of work
-- [ ] List all files that will be created/modified
-- [ ] Note all dependencies and blocking relationships
-
-### Step 2: Group into Phases
-
-Organize work into logical phases based on dependencies:
-
-**Phase 1 - Foundation (blocking):**
-- Database models, migrations
-- Service layer, business logic
-- Backend routes/endpoints
-- No UI; can run in parallel with nothing
-
-**Phase 2 - Core UI (depends on Phase 1):**
-- HTML templates, layout
-- JavaScript / interactive components
-- CSS / styling
-- Initial test suite
-
-**Phase 3 - Enhancement (depends on Phase 2):**
-- Charts, visualizations
-- Exports (PDF, CSV)
-- Advanced interactions
-- Performance optimizations
-
-**Phase 4+ - Polish & Advanced:**
-- Integration with 3rd-party APIs
-- Mobile API versions
-- Admin tools, bulk operations
-- Documentation
-
-### Step 3: Create Task Files
-
-For each work unit, create one `.md` file following the GitHub issue template structure.
-
-**Required sections:**
-1. **Summary** (one sentence)
-   - Format: "Create [X] to [achieve Y]"
-   - Example: "Create dashboard_service to calculate KPI metrics"
-
-2. **Context** (brief bullets)
-   <!-- CUSTOMIZE: Replace example file paths with your project's paths -->
-   - Relevant files: `[services directory]/dashboard_service.py`, `[models directory]/event.py`
-   - Related design doc: Reference the specific section
-   - Depends on: Task 01, Task 03 (if applicable)
-   - Constraints: "Must not break existing routes"
-
-3. **Acceptance Criteria** (checkboxes)
-   - [ ] Specific, testable assertions
-   - [ ] Reference file names and function names
-   - [ ] Include test command: `[TEST_COMMAND] tests/test_dashboard_service.py -v`
-
-4. **Implementation Notes** (step-by-step)
-   - Copy-pasteable code snippets (not pseudocode)
-   - Real file paths and project conventions
-   - References to `.github/copilot-instructions.md` patterns
-   - Database schema if applicable
-
-5. **Human Validation** (for UI tasks)
-   - [ ] Visit `/path/to/feature` in browser
-   - [ ] Verify specific user flows
-   - [ ] Check mobile responsiveness (if applicable)
-
-6. **Out of Scope** (prevent scope creep)
-   - Explicitly list what this task does NOT include
-   - Point to other tasks that handle related work
-
-### Step 4: Naming Convention
-
-Save task files with sequential numbers and slugs:
-
-```
-.github/prompts/my-feature/
-├── 01-database-models.md      # Task 1 of N
-├── 02-service-layer.md        # Task 2 of N
-├── 03-routes.md               # Task 3 of N
-├── 04-main-template.md        # Task 4 of N
-├── 05-sidebar-navigation.md   # Task 5 of N
-├── 06-javascript.md           # Task 6 of N
-├── 07-tests.md                # Task 7 of N
-├── 08-mobile-api.md           # Task 8 of N
-└── 09-documentation.md        # Task 9 of N
+Parsed Plan:
+  Title: [Feature Name]
+  Complexity: [X]/10
+  
+  Tasks identified:
+  - [ ] DB schema change (migration agent)
+  - [ ] Service layer + routes (backend agent)
+  - [ ] Templates + JS (frontend agent)
+  - [ ] Tests (test-writer agent)
+  - [ ] Mobile API (mobile-api agent) [optional]
+  - [ ] Structural improvements (refactor agent) [optional]
 ```
 
-**Naming rules:**
-- Two-digit prefix: `01-`, `02-`, etc. (preserves sort order)
-- Lowercase slug: descriptive, hyphenated
-- Matches feature name: all files in the same `my-feature/` folder
+---
 
-### Step 5: Dependency Mapping
+## Step 2: Build Dependency Graph
 
-In each task's **Context** section, document dependencies:
+For each task, determine:
+- What must complete before this can start?
+- What is waiting for this to complete?
+
+**Standard rules:**
+```
+migration → backend → frontend
+                   → test-writer
+                   → mobile-api
+```
+
+**Exception rules:**
+- If a task only changes config/docs: no dependencies
+- If a task creates new independent modules: may not need migration
+- If a refactor is purely structural: independent
+
+---
+
+## Step 3: Group Into Phases
+
+```
+Phase 1 (Sequential):
+  Everything that is in the critical path
+  Rule: migration must always be in Phase 1 if it exists
+
+Phase 2 (Parallel):
+  Everything that depends only on Phase 1 completion
+  Rule: frontend + test-writer + mobile-api can all be in Phase 2
+
+Phase 3 (Optional/Conditional):
+  Quality improvements, refactoring, polish
+  Rule: conditional on Phase 2 results (e.g., if coverage < threshold)
+```
+
+---
+
+## Step 4: Estimate Timing
+
+Apply timing estimates from `.github/skills/SMART-DISPATCH.md`:
+- Score each task as simple/medium/complex
+- Look up timing from the table
+- Calculate sequential total and parallel total
+- Compute savings
+
+---
+
+## Step 5: Generate agents.md
+
+Write the complete agents.md file following `.github/skills/agents-md-spec.md`:
 
 ```markdown
-## Context
+# Agent Dispatch Plan
 
-**Relevant files:** `[services directory]/feature_service.py`, `[models directory]/feature.py`
+**Feature:** [Title]
+**Complexity:** [X]/10
+**Sequential time:** [N] min | **Parallel time:** [M] min | **Savings:** [S] min ([P]% faster)
 
-**Related design:** Section 2.1 "Dashboard KPI Metrics" in design-my-feature.md
+## Phase 1: Foundation (sequential)
 
-**Depends on:**
-- Task 01 (models must exist)
-- Task 02 (service created)
+- [ ] **migration agent** — [task description]
+  - Files: [list]
+  - Depends on: (none)
+  - Blocks: backend agent
+  - Est time: [N] min
 
-**Blocks:**
-- Task 04 (UI template needs this service)
-- Task 07 (tests need service functions)
+- [ ] **backend agent** — [task description]
+  - Files: [list]
+  - Depends on: migration agent
+  - Blocks: frontend agent, test-writer, mobile-api
+  - Est time: [N] min
 
-**Constraints:**
-- Must not modify existing function signatures
-- Must use service layer pattern (not route handlers)
+## Phase 2: [Parallel description] (parallel)
+
+- [ ] **frontend agent** — [task description]
+  - Files: [list]
+  - Depends on: backend agent
+  - Blocks: none
+  - Est time: [N] min
+
+- [ ] **test-writer agent** — [task description]
+  - Files: [list]
+  - Depends on: backend agent
+  - Blocks: none
+  - Est time: [N] min
 ```
 
-### Step 6: Code Snippets
+---
 
-Make Implementation Notes copy-pasteable:
+## Step 6: Quality Check
 
-```python
-# ❌ Bad: pseudocode
-def calculate_metrics():
-    # TODO: get event
-    # TODO: sum up metrics
-    return metrics
+Before finalizing agents.md:
 
-# ✅ Good: real, working code (adapt to your project)
-from [your_orm] import func
+- [ ] Every agent has `depends_on` and `blocks` filled in
+- [ ] No circular dependencies
+- [ ] File paths are specific (not just "somewhere in src/")
+- [ ] Time estimates are realistic
+- [ ] Optional agents are marked `optional: true`
+- [ ] Phase labels accurately describe the parallelization
 
-def get_feature_kpis(feature_id: int) -> dict:
-    """Calculate KPI metrics for a feature."""
-    record = db.session.get(Feature, feature_id)
-    if not record:
-        return None
+---
 
-    total = db.session.query(func.count(Related.id)).filter_by(
-        feature_id=feature_id
-    ).scalar()
+## Step 7: Present for Approval
 
-    active = db.session.query(func.count(Related.id)).filter(
-        Related.feature_id == feature_id,
-        Related.is_active.is_(True)
-    ).scalar()
+Show the generated agents.md and timing analysis:
 
-    return {
-        "total": total,
-        "active": active,
-        "rate": (active / total * 100) if total > 0 else 0
-    }
+```
+📊 Plan Analysis Complete
+
+Feature: [Name]
+Complexity: [X]/10
+
+Phases:
+  Phase 1 (Sequential): [N agents, M min total]
+  Phase 2 (Parallel): [N agents, M min total]
+
+Timeline:
+  Sequential: [X] min
+  Parallel:   [Y] min
+  Savings:    [Z] min ([P]% faster)
+
+Risk: [LOW/MEDIUM/HIGH]
+  - [Risk detail if any]
+
+Generated agents.md saved to:
+  .github/prompts/issue-NNN-[title]/agents.md
+
+Ready to dispatch? Say "yes" to invoke task-orchestrator.
 ```
 
-### Step 7: Cross-Reference Design Doc
+---
 
-Every task should cite the specific section of the design document it implements:
+## Output: Acceptance Criteria Template
+
+Also generate `acceptance-criteria.md`:
 
 ```markdown
-## Summary
+# Acceptance Criteria: [Feature Name]
 
-Create feature_service.py to calculate KPI metrics.
+## Functional
+- [ ] [Core feature behavior works]
+- [ ] [Edge case handled]
 
-**Design reference:** Section 2.1 "Dashboard KPI Metrics" in design-my-feature.md
+## Technical
+- [ ] Tests pass: `[test command]`
+- [ ] No regressions in existing tests
+- [ ] Coverage: [threshold]%+
 
-> "The dashboard displays 4 key metrics: [metric 1], [metric 2],
-> [metric 3], and [metric 4]. Each metric updates as data changes."
+## Quality
+- [ ] All new routes have docstrings
+- [ ] No new lint errors
+- [ ] Migration valid (upgrade + downgrade tested)
+
+## Human Validation (if UI changes)
+- [ ] [Page/flow to test manually]
+- [ ] Mobile layout verified
+- [ ] Role-specific access verified
 ```
-
-### Step 8: Completeness Check
-
-Before finishing, verify all mapping:
-
-```markdown
-## Design-to-Task Mapping
-
-| Section | Task(s) | Status |
-|---------|---------|--------|
-| 1. Architecture Overview | — | Reference only |
-| 2.1 Dashboard KPI Metrics | Task 02, Task 04, Task 07 | ✅ |
-| 2.2 Real-time Updates | Task 06 (SSE/WS), Task 08 (mobile) | ✅ |
-| 3.1 Widget A | Task 04, Task 05 | ✅ |
-| 3.2 Widget B | Task 04, Task 05 | ✅ |
-| 4. Mobile API | Task 08 | ✅ |
-| 5. Testing | Task 07 | ✅ |
-| 6. Documentation | Task 09 | ✅ |
-```
-
-## Quality Checklist
-
-Before marking the skill as complete, verify:
-
-- [ ] **Coverage:** Every section of the design doc maps to at least one task
-- [ ] **No orphans:** Every task file references the design doc section it implements
-- [ ] **Acyclic:** No circular dependencies between tasks (use dependency graph)
-- [ ] **Granularity:** Each task is completable in ~30 min (single agent session)
-- [ ] **Acceptance criteria:** Specific enough to verify programmatically (not "looks good")
-- [ ] **Code snippets:** Real patterns, copy-pasteable, reference actual project files
-- [ ] **Scope boundaries:** Out of Scope sections prevent agents from overlapping
-- [ ] **Blocking clarity:** Dependency relationships are explicit ("Depends on Task X")
-- [ ] **Naming:** Sequential, sortable, descriptive (01-feature.md, 02-feature.md)
-- [ ] **README:** Create `.github/prompts/my-feature/README.md` with task overview
-
-## Example Output
-
-**Input:** `docs/design-my-feature.md` (12 sections)
-
-**Output:** `.github/prompts/my-feature/` (9 task files)
-
-```
-my-feature/
-├── README.md                          # Overview: 9 tasks, 3 phases
-├── 01-feature-service.md              # Service layer for KPI calculations
-├── 02-feature-model.md                # New table (if needed)
-├── 03-feature-route.md                # GET /features/<id>/dashboard
-├── 04-feature-template.md             # templates/features/dashboard.html
-├── 05-feature-js.md                   # static/js/features/dashboard.js
-├── 06-real-time-updates.md            # SSE/WebSocket endpoint for live metrics
-├── 07-mobile-api.md                   # GET /api/features/<id>/dashboard (mobile)
-└── 08-feature-tests.md                # Comprehensive test suite
-```
-
-**Phase dependencies:**
-- Phase 1 (blocking): Tasks 01, 02, 03
-- Phase 2 (depends on Phase 1): Tasks 04, 05, 06
-- Phase 3 (depends on Phase 2): Tasks 07, 08
-
-## References
-
-- GitHub issue template: `.github/prompts/issue-template.md`
-- Planning workflow: `.github/skills/PLANNING-WORKFLOW-GUIDE.md`
-- Agent parallelization: `.github/skills/agents-md-spec.md`
-- Project conventions: `.github/copilot-instructions.md`

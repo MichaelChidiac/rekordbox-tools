@@ -2,6 +2,40 @@
 
 This file is the entry point for AI coding agents (Claude, GitHub Copilot).
 
+## Code Exploration (jCodemunch MCP)
+
+This project uses the **jCodemunch MCP** server for symbol-level codebase retrieval.
+Prefer these tools over Read/Grep/Glob/Bash for code exploration:
+
+| Task | Tool |
+|------|------|
+| First time in a session | `resolve_repo` → if not indexed, `index_folder` |
+| Browse file structure | `get_file_tree` |
+| Understand a file | `get_file_outline` |
+| Find a function/class | `search_symbols` |
+| Full-text search | `search_text` |
+| Read a specific symbol | `get_symbol_source` |
+| Impact of a change | `get_blast_radius` |
+
+## Framework Submodule
+
+Generic agents/skills/prompts/instructions live in the `copilot-agent-framework/` submodule
+(`https://github.com/MichaelChidiac/copilot-agent-framework`).
+
+**To pull the latest framework updates:**
+```bash
+git submodule update --remote copilot-agent-framework
+```
+The Claude Code hook auto-detects the SHA change and syncs `.github/` on the next Bash command.
+
+**Protected files** (project-specific, never overwritten by the sync):
+- `.github/copilot-instructions.md`
+- `.github/agents/backend.md`
+- `.github/agents/migration.md`
+- `.github/instructions/database-rules.md`
+- `.github/instructions/service-layer-rules.md`
+- `.github/skills/SYNC-TO-FRAMEWORK.md`
+
 ## Project
 
 Python script toolkit for managing DJ libraries across Traktor, Rekordbox, and Pioneer USB drives.

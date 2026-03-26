@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "jcodemunch": {
+      "command": "uvx",
+      "args": ["jcodemunch-mcp"]
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null)/scripts/sync_framework.sh\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
