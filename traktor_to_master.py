@@ -36,6 +36,12 @@ from urllib.parse import unquote
 
 import sqlcipher3
 
+from config import MASTER_DB_KEY
+from tag_config import (
+    parse_comment_tags, load_tag_categories, save_tag_categories,
+    merge_new_tags, classify_tag, classify_all_tags, DEFAULT_CONFIG_PATH,
+)
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -44,7 +50,6 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
 MASTER_DB     = Path.home() / "Library/Pioneer/rekordbox/master.db"
 PLAYLISTS_XML = Path.home() / "Library/Pioneer/rekordbox/masterPlaylists6.xml"
 DEFAULT_NML   = Path.home() / "Documents/Native Instruments/Traktor 3.11.1/collection.nml"
@@ -109,7 +114,8 @@ def new_uuid() -> str:
 def next_usn(con) -> int:
     """Return max(rb_local_usn) + 1 across all DJ tables. Call ONCE per session."""
     m = 0
-    for tbl in ('djmdPlaylist', 'djmdContent', 'djmdSongPlaylist', 'djmdCue'):
+    for tbl in ('djmdPlaylist', 'djmdContent', 'djmdSongPlaylist', 'djmdCue',
+                'djmdMyTag', 'djmdSongMyTag'):
         v = con.execute(f'SELECT MAX(rb_local_usn) FROM {tbl}').fetchone()[0]
         if v and v > m:
             m = v
@@ -121,7 +127,7 @@ def open_db(path: Path):
     PRAGMA legacy=4 is CRITICAL — without it SQLCipher raises "file is not a database".
     """
     con = sqlcipher3.connect(str(path))
-    con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
+    con.execute(f"PRAGMA key='{MASTER_DB_KEY}'")
     con.execute("PRAGMA cipher='sqlcipher'")
     con.execute("PRAGMA legacy=4")   # CRITICAL
     con.execute("PRAGMA foreign_keys=OFF")
@@ -226,7 +232,11 @@ def parse_tracks(root) -> dict:
             'filename':    file_,
             'cues':        [],
             'grid':        [],
+            'tags':        [],  # [bracket] tags from comment — filled below
         }
+
+        # Extract [bracket] tags from comment field
+        t['tags'] = parse_comment_tags(t['comment'])
 
         for cue in entry.findall('CUE_V2'):
             cue_type_traktor = int(cue.get('TYPE', '0'))
@@ -832,6 +842,107 @@ def sync_playlists(con, selected_playlists: list, tracks: dict,
     return pl_count
 
 
+# ── MyTag Sync ────────────────────────────────────────────────────────────────
+
+def sync_mytags(con, tracks: dict, path_to_content_id: dict,
+                tag_categories: dict, usn: int) -> tuple:
+    """
+    Insert MyTag categories, tags, and track-tag links into master.db.
+
+    Tables:
+      djmdMyTag     — tag definitions (categories as parents, tags as children)
+      djmdSongMyTag — track-tag associations
+
+    Returns:
+        (categories_created, tags_created, links_created)
+    """
+    ts = now_ts()
+    cats_created = 0
+    tags_created = 0
+    links_created = 0
+
+    # Collect all unique tags across all tracks
+    all_tags = set()
+    for t in tracks.values():
+        for tag in t.get('tags', []):
+            all_tags.add(tag)
+
+    if not all_tags:
+        return (0, 0, 0)
+
+    # Build category→tags mapping
+    cat_tags: dict[str, list[str]] = {}
+    for tag in sorted(all_tags):
+        cat = classify_tag(tag, tag_categories)
+        cat_tags.setdefault(cat, []).append(tag)
+
+    # Insert category rows (Attribute=1 = folder/category)
+    cat_id_map: dict[str, str] = {}  # category_name → ID
+    seq = 0
+    for cat_name in sorted(cat_tags.keys()):
+        cat_id = make_id(f'mytag-cat:{cat_name}')
+        # Collision guard
+        existing = con.execute("SELECT ID FROM djmdMyTag WHERE ID=?", (cat_id,)).fetchone()
+        if existing is None:
+            con.execute("""INSERT OR IGNORE INTO djmdMyTag
+                (ID, Seq, Name, Attribute, ParentID, UUID,
+                 rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                 usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,1,NULL,?,0,0,0,0,?,?,?,?)""",
+                (cat_id, seq, cat_name, new_uuid(), usn, usn, ts, ts))
+            cats_created += 1
+        cat_id_map[cat_name] = cat_id
+        seq += 1
+
+    # Insert tag rows (Attribute=0 = tag/leaf)
+    tag_id_map: dict[str, str] = {}  # tag_name_lower → ID
+    for cat_name, tag_list in sorted(cat_tags.items()):
+        parent_id = cat_id_map[cat_name]
+        tag_seq = 0
+        for tag_name in sorted(tag_list):
+            tag_id = make_id(f'mytag:{tag_name}')
+            existing = con.execute("SELECT ID FROM djmdMyTag WHERE ID=?", (tag_id,)).fetchone()
+            if existing is None:
+                con.execute("""INSERT OR IGNORE INTO djmdMyTag
+                    (ID, Seq, Name, Attribute, ParentID, UUID,
+                     rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                     usn, rb_local_usn, created_at, updated_at)
+                    VALUES (?,?,?,0,?,?,0,0,0,0,?,?,?,?)""",
+                    (tag_id, tag_seq, tag_name, parent_id, new_uuid(), usn, usn, ts, ts))
+                tags_created += 1
+            tag_id_map[tag_name.lower()] = tag_id
+            tag_seq += 1
+
+    # Insert track-tag links into djmdSongMyTag
+    track_no_counter: dict[str, int] = {}  # tag_id → next TrackNo
+    for traktor_key, t in tracks.items():
+        content_id = path_to_content_id.get(t.get('location', ''))
+        if not content_id:
+            continue
+        for tag_name in t.get('tags', []):
+            tag_id = tag_id_map.get(tag_name.lower())
+            if not tag_id:
+                continue
+            link_id = make_id(f'mytag-link:{tag_id}:{content_id}')
+            track_no = track_no_counter.get(tag_id, 0)
+            track_no_counter[tag_id] = track_no + 1
+            existing = con.execute(
+                "SELECT ID FROM djmdSongMyTag WHERE ID=?", (link_id,)
+            ).fetchone()
+            if existing is None:
+                con.execute("""INSERT OR IGNORE INTO djmdSongMyTag
+                    (ID, MyTagID, ContentID, TrackNo, UUID,
+                     rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                     usn, rb_local_usn, created_at, updated_at)
+                    VALUES (?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+                    (link_id, tag_id, str(content_id), track_no, new_uuid(),
+                     usn, usn, ts, ts))
+                links_created += 1
+
+    con.commit()
+    return (cats_created, tags_created, links_created)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -849,7 +960,13 @@ def main():
                         help=f'Path to collection.nml (default: {DEFAULT_NML})')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print what would change without writing anything')
+    tag_group = parser.add_mutually_exclusive_group()
+    tag_group.add_argument('--tags', action='store_true', default=True,
+                           help='Enable comment-to-MyTag conversion (default: on)')
+    tag_group.add_argument('--no-tags', action='store_true',
+                           help='Skip MyTag conversion')
     args = parser.parse_args()
+    do_tags = args.tags and not args.no_tags
 
     nml_path = Path(args.nml)
 
@@ -895,6 +1012,37 @@ def main():
             track_count  = len([k for k in pl_node['keys'] if tracks.get(k)])
             path_display = ' / '.join(path_tuple)
             print(f'  {path_display} ({track_count} tracks)')
+
+        # MyTag dry-run preview
+        if do_tags:
+            tag_categories = load_tag_categories()
+            all_tags = set()
+            for t in selected_tracks.values():
+                all_tags.update(t.get('tags', []))
+            if all_tags:
+                cat_breakdown = classify_all_tags(sorted(all_tags), tag_categories)
+                # Count potential links
+                link_count = sum(
+                    len(t.get('tags', [])) for t in selected_tracks.values()
+                )
+                print(f'\n🏷️  MyTag conversion:')
+                print(f'  Would create {len(cat_breakdown)} categories')
+                print(f'  Would create {len(all_tags)} tags across categories')
+                print(f'  Would create up to {link_count} track-tag links')
+                print(f'  Category breakdown:')
+                for cat, tags in sorted(cat_breakdown.items()):
+                    tag_preview = ', '.join(tags[:5])
+                    if len(tags) > 5:
+                        tag_preview += f', … (+{len(tags)-5} more)'
+                    print(f'    {cat} ({len(tags)} tags): {tag_preview}')
+
+                # Show would-be config (but don't write it)
+                has_new = merge_new_tags(tag_categories, list(all_tags))
+                if has_new:
+                    print(f'\n  Would update {DEFAULT_CONFIG_PATH.name} with new tags')
+            else:
+                print(f'\n🏷️  MyTag conversion: no [bracket] tags found in comments')
+
         sys.exit(0)
 
     # ── 4. Backup master.db ───────────────────────────────────────────────────
@@ -919,6 +1067,25 @@ def main():
             con, selected_playlists, tracks, path_to_content_id, usn
         )
 
+        # ── 8b. Sync MyTags from comment [bracket] tags ──────────────────────
+        mytag_cats = mytag_tags = mytag_links = 0
+        if do_tags:
+            tag_categories = load_tag_categories()
+            # Merge any new tags into the categories dict
+            all_discovered = set()
+            for t in selected_tracks.values():
+                all_discovered.update(t.get('tags', []))
+            has_new = merge_new_tags(tag_categories, list(all_discovered))
+
+            mytag_cats, mytag_tags, mytag_links = sync_mytags(
+                con, selected_tracks, path_to_content_id, tag_categories, usn
+            )
+
+            # Save updated config (new tags may have been added to Uncategorized)
+            if has_new or not DEFAULT_CONFIG_PATH.exists():
+                save_tag_categories(DEFAULT_CONFIG_PATH, tag_categories)
+                print(f'  📝 Saved {DEFAULT_CONFIG_PATH.name}')
+
         # ── 9. Rebuild masterPlaylists6.xml from full DB state ────────────────
         manifest_nodes = build_manifest_from_db(con)
         write_playlists_xml(PLAYLISTS_XML, manifest_nodes, dry_run=False)
@@ -938,6 +1105,8 @@ def main():
     # ── 10. Summary ───────────────────────────────────────────────────────────
     print(f'\n✅ Done: {new_count} new tracks added, {skipped_count} already in DB, '
           f'{pl_count} playlists synced')
+    if do_tags and (mytag_cats or mytag_tags or mytag_links):
+        print(f'   🏷️  MyTags: {mytag_cats} categories, {mytag_tags} tags, {mytag_links} track-tag links')
 
 
 if __name__ == '__main__':

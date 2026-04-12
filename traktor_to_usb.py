@@ -57,6 +57,7 @@ import argparse, datetime, os, shutil, sys, time, uuid, zlib, atexit
 from pathlib import Path
 
 import sqlcipher3 as sqlite3
+from config import MASTER_DB_KEY, EXPORT_DB_KEY
 
 # ── Auto-save checkpoint handler ────────────────────────────────────────────
 _checkpoint_callback = None
@@ -90,9 +91,6 @@ def force_checkpoint():
 # ── Config ─────────────────────────────────────────────────────────────────────
 MASTER_DB      = Path.home() / "Library/Pioneer/rekordbox/master.db"
 PIONEER_SHARE  = Path.home() / "Library/Pioneer/rekordbox/share"
-KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
-# Device Library Plus key (exportLibrary.db on USB) — different from master.db key
-EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
 PIONEER_DIR = "PIONEER"
 AUDIO_DIR   = "Contents"
 
@@ -117,7 +115,16 @@ def new_uuid():
 def to_hex(n):
     return format(int(n), 'X').upper()
 
-def open_db(path, key=KEY):
+
+def backup_usb_db(db_path: Path) -> Path:
+    """Create a timestamped backup of exportLibrary.db before any write operation."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = db_path.parent / f"exportLibrary_backup_{ts}.db"
+    shutil.copy2(db_path, backup)
+    print(f"  ✅ USB DB backup: {backup}")
+    return backup
+
+def open_db(path, key=MASTER_DB_KEY):
     con = sqlite3.connect(str(path), timeout=30)
     con.execute(f"PRAGMA key='{key}'")
     con.execute("PRAGMA cipher='sqlcipher'")
@@ -126,7 +133,7 @@ def open_db(path, key=KEY):
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
-def open_export_db(path, key=EXPORT_KEY):
+def open_export_db(path, key=EXPORT_DB_KEY):
     """Open a Device Library Plus database (exportLibrary.db on USB).
     Uses SQLCipher 4 defaults (no legacy mode) and the export key."""
     con = sqlite3.connect(str(path), timeout=30)
@@ -604,6 +611,31 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         ).fetchall():
             cues.setdefault(r[1], []).append(r)
 
+    # Cues formatted for ANLZ auto-generation
+    anlz_cues = {}
+    if tracks_to_process:
+        _ANLZ_KIND = {0: 0, 1: 1, 2: 2, 3: 3, 4: 1}
+        for r in master.execute(
+            f"SELECT ContentID, InMsec, OutMsec, Kind, ColorTableIndex, Comment "
+            f"FROM djmdCue WHERE ContentID IN ({ph2}) AND rb_local_deleted=0 "
+            f"ORDER BY ContentID, InMsec",
+            list(tracks_to_process)
+        ).fetchall():
+            cid_c, in_ms, out_ms, kind, color_idx, comment = r
+            if in_ms is None:
+                continue
+            loop_end = int(out_ms) if (kind == 4 and out_ms) else 0xFFFFFFFF
+            _list = anlz_cues.setdefault(cid_c, [])
+            hot_idx = len(_list)
+            _list.append({
+                "hot_cue":     hot_idx if hot_idx < 8 else 0xFF,
+                "kind":        _ANLZ_KIND.get(kind, 0),
+                "time_ms":     int(in_ms),
+                "loop_end_ms": loop_end,
+                "color_idx":   int(color_idx) if color_idx else 0,
+                "name":        comment or "",
+            })
+
     # ── Fetch genre/album/label lookup data from master.db ──────────────────
     genre_rows_master = {}
     album_rows_master = {}
@@ -635,7 +667,33 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
         """, list(all_content_ids)).fetchall():
             label_rows_master[r[0]] = r
 
+    # MyTag data for tracks in scope
+    mytag_rows_master = []
+    song_mytag_rows_master = []
+    if all_content_ids:
+        # All MyTag definitions (categories + tags) — we need the full tree
+        mytag_rows_master = master.execute(
+            "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdMyTag WHERE rb_local_deleted=0"
+        ).fetchall()
+
+        # Only song-tag links for content IDs in scope
+        ph_all = ','.join('?' * len(all_content_ids))
+        song_mytag_rows_master = master.execute(
+            f"SELECT ID, MyTagID, ContentID, TrackNo FROM djmdSongMyTag "
+            f"WHERE rb_local_deleted=0 AND ContentID IN ({ph_all})",
+            list(all_content_ids)
+        ).fetchall()
+
     master.close()
+
+    # Load Traktor NML for beat grid phase offsets (used in ANLZ auto-generation)
+    _nml_index = {}
+    try:
+        from generate_anlz import load_nml_index, NML_PATH as _NML_PATH
+        if _NML_PATH.exists():
+            _nml_index = load_nml_index(_NML_PATH)
+    except Exception as _e:
+        pass  # generate_anlz unavailable or NML missing — ANLZ auto-gen will use phase=0
 
     # ── NAS lookup for missing tracks ──────────────────────────────────────────
     nas_available = {}
@@ -694,6 +752,10 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
             print(f"  Would rebuild playlist tree ({len(playlist_ids)} playlists)")
         return
 
+
+    # ── Backup existing DB before any write ───────────────────────────────────────
+    if usb_db_path.exists():
+        backup_usb_db(usb_db_path)
     # ── Prepare directories + DB ───────────────────────────────────────────────
     for d in [usb_rb_dir, usb_anlz, usb_audio]:
         d.mkdir(parents=True, exist_ok=True)
@@ -707,423 +769,488 @@ def export_to_usb(usb_path: Path, playlist_ids: set, tree: dict, mode: str = 'up
                 p.unlink()
         print("  Removed existing DLP database (will recreate)")
 
-    is_fresh = not usb_db_path.exists()
-    usb_con = open_db(usb_db_path)
-    if is_fresh:
-        init_usb_db(usb_con, usb_path)
-
-    usn = 1  # USN to stamp all our writes with
-    usb_db_id = str(make_id(str(usb_path)))  # This USB's DBID (matches djmdProperty.DBID)
-
-    # ── Artist cache ──────────────────────────────────────────────────────────
-    artist_cache = {}
-    def get_or_insert_artist(name):
-        if not name:
-            return None
-        if name in artist_cache:
-            return artist_cache[name]
-        aid = str(make_id(f"artist:{name}"))
-        usb_con.execute("""INSERT OR IGNORE INTO djmdArtist
-            (ID, Name, SearchStr, UUID, rb_data_status, rb_local_data_status,
-             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
-            VALUES (?,?,?,?,0,0,0,0,?,?,?,?)""",
-            (aid, name, name, new_uuid(), usn, usn, ts(), ts()))
-        artist_cache[name] = aid
-        return aid
-
-    # ── Insert genre/album/label lookup data ──────────────────────────────────
-    for gid, row in genre_rows_master.items():
-        usb_con.execute("""INSERT OR IGNORE INTO djmdGenre
-            (ID, Name, UUID, rb_data_status, rb_local_data_status,
-             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
-            VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
-            (str(gid), row[1], new_uuid(), usn, usn, ts(), ts()))
-
-    for aid, row in album_rows_master.items():
-        usb_con.execute("""INSERT OR IGNORE INTO djmdAlbum
-            (ID, Name, AlbumArtistID, ImagePath, Compilation, SearchStr,
-             UUID, rb_data_status, rb_local_data_status,
-             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
-            (str(aid), row[1], str(row[2]) if row[2] else '', '',
-             row[4] if row[4] is not None else 0, row[5] or '',
-             new_uuid(), usn, usn, ts(), ts()))
-
-    for lid, row in label_rows_master.items():
-        usb_con.execute("""INSERT OR IGNORE INTO djmdLabel
-            (ID, Name, UUID, rb_data_status, rb_local_data_status,
-             rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
-            VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
-            (str(lid), row[1], new_uuid(), usn, usn, ts(), ts()))
-
-    # ── Remove deleted tracks ─────────────────────────────────────────────────
-    if deleted_ids:
-        ph_del = ','.join('?' * len(deleted_ids))
-        usb_con.execute(f"DELETE FROM djmdSongPlaylist WHERE ContentID IN ({ph_del})", list(deleted_ids))
-        usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID IN ({ph_del})", list(deleted_ids))
-        usb_con.execute(f"DELETE FROM djmdContent WHERE ID IN ({ph_del})", list(deleted_ids))
-        print(f"  🗑  Removed {len(deleted_ids)} deleted tracks")
-
-    # ── Copy audio + ANLZ, insert into DB ─────────────────────────────────────
-    copied_audio   = 0
-    skipped_audio  = 0
-    copied_anlz    = 0
-    copied_artwork = 0
-    missing_audio  = []
-    fetched_from_nas = 0
-    nas_fetch_failed = 0
-
-    total = len(tracks)
-    for i, (cid, row) in enumerate(tracks.items(), 1):
-        # Print progress for every track (flush for real-time display)
-        if i % max(1, total // 100) == 0 or i == total or i == 1:
-            print(f"  [{i}/{total}] Processing tracks…", flush=True)
-
-        (db_id, folder_path, filename, title, bpm, length, ftype,
-         bitrate, samplerate, comment, rating, color_id, key_id, track_uuid,
-         artist_name, album_name, file_size,
-         genre_id, album_id, label_id, master_artist_id, remixer_id, org_artist_id,
-         composer_id, lyricist, release_year, disc_no, track_no,
-         genre_name, label_name, image_path) = row
-
-        # Audio
-        artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
-        album_slug = (album_name or 'Unknown Album').replace('/', '_').replace(':', '_')[:50]
-        src_audio = Path(folder_path) if folder_path else None
-        got_audio = False
-
-        if src_audio and src_audio.exists():
-            # File exists locally — copy to USB
-            dst_dir = usb_audio / artist_slug / album_slug
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst_audio = dst_dir / filename
-            if not dst_audio.exists():
-                safe_copy(src_audio, dst_audio)
-                copied_audio += 1
-            else:
-                skipped_audio += 1
-            got_audio = True
-
-        elif fetch_nas and folder_path and folder_path in nas_available:
-            # File missing locally but available on NAS — download to USB
-            from nas_lookup import download_from_nas, TRAKTOR_ML_API
-            dst_dir = usb_audio / artist_slug / album_slug
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst_audio = dst_dir / filename
-            if dst_audio.exists():
-                skipped_audio += 1
+    try:
+        is_fresh = not usb_db_path.exists()
+        usb_con = open_db(usb_db_path)
+        if is_fresh:
+            init_usb_db(usb_con, usb_path)
+    
+        usn = 1  # USN to stamp all our writes with
+        usb_db_id = str(make_id(str(usb_path)))  # This USB's DBID (matches djmdProperty.DBID)
+    
+        # ── Artist cache ──────────────────────────────────────────────────────────
+        artist_cache = {}
+        def get_or_insert_artist(name):
+            if not name:
+                return None
+            if name in artist_cache:
+                return artist_cache[name]
+            aid = str(make_id(f"artist:{name}"))
+            usb_con.execute("""INSERT OR IGNORE INTO djmdArtist
+                (ID, Name, SearchStr, UUID, rb_data_status, rb_local_data_status,
+                 rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,?,0,0,0,0,?,?,?,?)""",
+                (aid, name, name, new_uuid(), usn, usn, ts(), ts()))
+            artist_cache[name] = aid
+            return aid
+    
+        # ── Insert genre/album/label lookup data ──────────────────────────────────
+        for gid, row in genre_rows_master.items():
+            usb_con.execute("""INSERT OR IGNORE INTO djmdGenre
+                (ID, Name, UUID, rb_data_status, rb_local_data_status,
+                 rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
+                (str(gid), row[1], new_uuid(), usn, usn, ts(), ts()))
+    
+        for aid, row in album_rows_master.items():
+            usb_con.execute("""INSERT OR IGNORE INTO djmdAlbum
+                (ID, Name, AlbumArtistID, ImagePath, Compilation, SearchStr,
+                 UUID, rb_data_status, rb_local_data_status,
+                 rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+                (str(aid), row[1], str(row[2]) if row[2] else '', '',
+                 row[4] if row[4] is not None else 0, row[5] or '',
+                 new_uuid(), usn, usn, ts(), ts()))
+    
+        for lid, row in label_rows_master.items():
+            usb_con.execute("""INSERT OR IGNORE INTO djmdLabel
+                (ID, Name, UUID, rb_data_status, rb_local_data_status,
+                 rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,0,0,0,0,?,?,?,?)""",
+                (str(lid), row[1], new_uuid(), usn, usn, ts(), ts()))
+    
+        # ── Remove deleted tracks ─────────────────────────────────────────────────
+        if deleted_ids:
+            ph_del = ','.join('?' * len(deleted_ids))
+            usb_con.execute(f"DELETE FROM djmdSongPlaylist WHERE ContentID IN ({ph_del})", list(deleted_ids))
+            usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID IN ({ph_del})", list(deleted_ids))
+            usb_con.execute(f"DELETE FROM djmdContent WHERE ID IN ({ph_del})", list(deleted_ids))
+            print(f"  🗑  Removed {len(deleted_ids)} deleted tracks")
+    
+        # ── Copy audio + ANLZ, insert into DB ─────────────────────────────────────
+        copied_audio   = 0
+        skipped_audio  = 0
+        copied_anlz    = 0
+        generated_anlz = 0
+        copied_artwork = 0
+        missing_audio  = []
+        fetched_from_nas = 0
+        nas_fetch_failed = 0
+    
+        total = len(tracks)
+        for i, (cid, row) in enumerate(tracks.items(), 1):
+            # Print progress for every track (flush for real-time display)
+            if i % max(1, total // 100) == 0 or i == total or i == 1:
+                print(f"  [{i}/{total}] Processing tracks…", flush=True)
+    
+            (db_id, folder_path, filename, title, bpm, length, ftype,
+             bitrate, samplerate, comment, rating, color_id, key_id, track_uuid,
+             artist_name, album_name, file_size,
+             genre_id, album_id, label_id, master_artist_id, remixer_id, org_artist_id,
+             composer_id, lyricist, release_year, disc_no, track_no,
+             genre_name, label_name, image_path) = row
+    
+            # Audio
+            artist_slug = (artist_name or 'Unknown').replace('/', '_').replace(':', '_')[:50]
+            album_slug = (album_name or 'Unknown Album').replace('/', '_').replace(':', '_')[:50]
+            src_audio = Path(folder_path) if folder_path else None
+            got_audio = False
+    
+            if src_audio and src_audio.exists():
+                # File exists locally — copy to USB
+                dst_dir = usb_audio / artist_slug / album_slug
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_audio = dst_dir / filename
+                if not dst_audio.exists():
+                    safe_copy(src_audio, dst_audio)
+                    copied_audio += 1
+                else:
+                    skipped_audio += 1
                 got_audio = True
-            else:
-                nas_info = nas_available[folder_path]
-                if download_from_nas(folder_path, dst_audio, TRAKTOR_ML_API, nas_info.file_hash):
-                    fetched_from_nas += 1
+    
+            elif fetch_nas and folder_path and folder_path in nas_available:
+                # File missing locally but available on NAS — download to USB
+                from nas_lookup import download_from_nas, TRAKTOR_ML_API
+                dst_dir = usb_audio / artist_slug / album_slug
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_audio = dst_dir / filename
+                if dst_audio.exists():
+                    skipped_audio += 1
                     got_audio = True
                 else:
-                    nas_fetch_failed += 1
-
-        if not got_audio:
-            if cid in existing_ids:
-                # Track already on USB — keep its audio, just update DB entry
+                    nas_info = nas_available[folder_path]
+                    if download_from_nas(folder_path, dst_audio, TRAKTOR_ML_API, nas_info.file_hash):
+                        fetched_from_nas += 1
+                        got_audio = True
+                    else:
+                        nas_fetch_failed += 1
+    
+            if not got_audio:
+                if cid in existing_ids:
+                    # Track already on USB — keep its audio, just update DB entry
+                    usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{album_slug}/{filename}"
+                    skipped_audio += 1
+                else:
+                    # Track is genuinely missing — skip entirely
+                    if folder_path:
+                        missing_audio.append(folder_path)
+                    continue
+    
+            else:
                 usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{album_slug}/{filename}"
-                skipped_audio += 1
-            else:
-                # Track is genuinely missing — skip entirely
-                if folder_path:
-                    missing_audio.append(folder_path)
-                continue
-
-        else:
-            usb_audio_rel = f"/{AUDIO_DIR}/{artist_slug}/{album_slug}/{filename}"
-
-        # ANLZ
-        for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
-            if not local_anlz_path:
-                continue
-            src = Path(local_anlz_path)
-            if not src.exists():
-                continue
-            rel_parts = Path(usb_anlz_path.lstrip('/')).parts
-            if len(rel_parts) >= 3 and rel_parts[0] == 'PIONEER' and rel_parts[1] == 'USBANLZ':
-                dst_anlz = usb_path / PIONEER_DIR / 'USBANLZ' / Path(*rel_parts[2:])
-            else:
-                dst_anlz = usb_anlz / Path(usb_anlz_path.lstrip('/'))
-            dst_anlz.parent.mkdir(parents=True, exist_ok=True)
-            if not dst_anlz.exists():
-                safe_copy(src, dst_anlz)
-                copied_anlz += 1
-
-        # Artwork — copy all size variants (artwork.jpg, artwork_s.jpg, artwork_m.jpg)
-        usb_image_path = ''
-        if image_path:
-            local_art = PIONEER_SHARE / image_path.lstrip('/')
-            if local_art.exists():
-                art_dir_src = local_art.parent
-                art_dir_dst = usb_path / Path(image_path.lstrip('/')).parent
-                art_dir_dst.mkdir(parents=True, exist_ok=True)
-                for art_file in art_dir_src.glob('artwork*.jpg'):
-                    dst_art = art_dir_dst / art_file.name
-                    if not dst_art.exists():
-                        safe_copy(art_file, dst_art)
-                        copied_artwork += 1
-                usb_image_path = image_path  # keep the same relative path on USB
-
-        # DB: content — full Rekordbox 6 schema
-        artist_id = get_or_insert_artist(artist_name)
-        file_name_s = Path(filename).stem if filename else ''
-        search_str  = f"{title or ''} {artist_name or ''}".strip()
-        # Use first ANLZ path if available for AnalysisDataPath
-        _anlz_entries = anlz_map.get(cid, [])
-        anlz_data_path = _anlz_entries[0][0] if _anlz_entries else ''
-        usb_con.execute("""INSERT OR REPLACE INTO djmdContent (
-            ID, FolderPath, FileNameL, FileNameS, Title, ArtistID, AlbumID, GenreID,
-            BPM, Length, TrackNo, BitRate, BitDepth, Commnt, FileType, Rating,
-            ReleaseYear, RemixerID, LabelID, OrgArtistID, KeyID, StockDate, ColorID,
-            DJPlayCount, ImagePath, MasterDBID, MasterSongID, AnalysisDataPath,
-            SearchStr, FileSize, DiscNo, ComposerID, Subtitle, SampleRate,
-            DisableQuantize, Analysed, ReleaseDate, DateCreated, ContentLink, Tag,
-            ModifiedByRBM, HotCueAutoLoad, DeliveryControl, DeliveryComment,
-            CueUpdated, AnalysisUpdated, TrackInfoUpdated, Lyricist, ISRC,
-            SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate,
-            LyricStatus, ServiceID, OrgFolderPath,
-            Reserved1, Reserved2, Reserved3, Reserved4, ExtInfo,
-            rb_file_id, DeviceID, rb_LocalFolderPath,
-            SrcID, SrcTitle, SrcArtistName, SrcAlbumName, SrcLength,
-            UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
-            usn, rb_local_usn, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(db_id), usb_audio_rel, filename, file_name_s,
-             title or filename, artist_id, str(album_id) if album_id else '', str(genre_id) if genre_id else '',
-             bpm, length, track_no or 0, bitrate, 0, comment, ftype, rating or 0,
-             release_year or 0, str(remixer_id) if remixer_id else '', str(label_id) if label_id else '', str(org_artist_id) if org_artist_id else '', key_id, '', color_id,
-             0, usb_image_path, usb_db_id, str(db_id), anlz_data_path or '',
-             search_str, file_size or 0, disc_no or 0, str(composer_id) if composer_id else '', '', samplerate,
-             0, 1, '', ts(), 0, '',
-             '', '', '', '', '', '', '', lyricist or '', '',
-             0, 0, 0.0, '', 0, 0, '',
-             '', '', '', '', '',
-             '', '', '',
-             '', '', '', '', 0,
-             track_uuid or new_uuid(), 257, 0, 0, 0,
-             usn, usn, ts(), ts()))
-
-        # DB: cues (replace on sync to pick up changes)
-        # master.db djmdCue column order (SELECT *):
-        #   0:ID 1:ContentID 2:InMsec 3:InFrame 4:InMpegFrame 5:InMpegAbs
-        #   6:OutMsec 7:OutFrame 8:OutMpegFrame 9:OutMpegAbs 10:Kind 11:Color
-        #   12:ColorTableIndex 13:ActiveLoop 14:Comment 15:BeatLoopSize 16:CueMicrosec
-        #   17:InPointSeekInfo 18:OutPointSeekInfo 19:ContentUUID 20:UUID
-        #   21:rb_data_status 22:rb_local_data_status 23:rb_local_deleted
-        #   24:rb_local_synced 25:usn 26:rb_local_usn 27:created_at 28:updated_at
-        usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID=?", (str(db_id),))
-        for cue in cues.get(cid, []):
-            usb_con.execute("""INSERT OR IGNORE INTO djmdCue (
-                ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs,
-                OutMsec, OutFrame, OutMpegFrame, OutMpegAbs, Kind, Color,
-                ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, CueMicrosec,
-                InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID,
-                rb_data_status, rb_local_data_status,
-                rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
-                (cue[0], str(db_id), cue[2], cue[3], cue[4], cue[5],
-                 cue[6], cue[7], cue[8], cue[9], cue[10], cue[11],
-                 cue[12], cue[13], cue[14], cue[15], cue[16],
-                 cue[17], cue[18], cue[19], cue[20],
+    
+            # Auto-generate ANLZ if not yet analysed in master.db
+            if not anlz_map.get(cid) and track_uuid:
+                try:
+                    from generate_anlz import (
+                        analyze_audio, silent_waveform, generate_beats,
+                        assemble_dat, assemble_ext, anlz_paths_for_uuid,
+                    )
+                    _audio   = folder_path if folder_path and os.path.isfile(folder_path) else None
+                    _wav     = (analyze_audio(_audio) if _audio else None) or silent_waveform()
+                    _dur     = _wav["duration_ms"] or (int(length or 0) * 1000)
+                    _phase   = _nml_index.get((filename or "").lower(), {}).get("phase_ms", 0.0)
+                    _beats   = generate_beats(bpm or 0, _phase, _dur)
+                    _cues    = anlz_cues.get(cid, [])
+                    _paths   = anlz_paths_for_uuid(track_uuid)
+                    _ppth    = folder_path or filename or ""
+                    _paths["dir"].mkdir(parents=True, exist_ok=True)
+                    _dat = assemble_dat(_ppth, _beats, _wav["pwav"], _wav["pwv2"], _cues)
+                    _paths["dat"].write_bytes(_dat)
+                    _new = [(_paths["rel_dat"], str(_paths["dat"]))]
+                    if _wav.get("pwv4"):
+                        _ext = assemble_ext(_ppth, _wav["pwv3"], _wav["pwv4"], _cues)
+                        _paths["ext"].write_bytes(_ext)
+                        _new.append((_paths["rel_ext"], str(_paths["ext"])))
+                    anlz_map[cid] = _new
+                    generated_anlz += 1
+                except Exception as _gen_e:
+                    pass  # silently skip — track will export without ANLZ
+    
+            # ANLZ
+            for (usb_anlz_path, local_anlz_path) in anlz_map.get(cid, []):
+                if not local_anlz_path:
+                    continue
+                src = Path(local_anlz_path)
+                if not src.exists():
+                    continue
+                rel_parts = Path(usb_anlz_path.lstrip('/')).parts
+                if len(rel_parts) >= 3 and rel_parts[0] == 'PIONEER' and rel_parts[1] == 'USBANLZ':
+                    dst_anlz = usb_path / PIONEER_DIR / 'USBANLZ' / Path(*rel_parts[2:])
+                else:
+                    dst_anlz = usb_anlz / Path(usb_anlz_path.lstrip('/'))
+                dst_anlz.parent.mkdir(parents=True, exist_ok=True)
+                if not dst_anlz.exists():
+                    safe_copy(src, dst_anlz)
+                    copied_anlz += 1
+    
+            # Artwork — copy all size variants (artwork.jpg, artwork_s.jpg, artwork_m.jpg)
+            usb_image_path = ''
+            if image_path:
+                local_art = PIONEER_SHARE / image_path.lstrip('/')
+                if local_art.exists():
+                    art_dir_src = local_art.parent
+                    art_dir_dst = usb_path / Path(image_path.lstrip('/')).parent
+                    art_dir_dst.mkdir(parents=True, exist_ok=True)
+                    for art_file in art_dir_src.glob('artwork*.jpg'):
+                        dst_art = art_dir_dst / art_file.name
+                        if not dst_art.exists():
+                            safe_copy(art_file, dst_art)
+                            copied_artwork += 1
+                    usb_image_path = image_path  # keep the same relative path on USB
+    
+            # DB: content — full Rekordbox 6 schema
+            artist_id = get_or_insert_artist(artist_name)
+            file_name_s = Path(filename).stem if filename else ''
+            search_str  = f"{title or ''} {artist_name or ''}".strip()
+            # Use first ANLZ path if available for AnalysisDataPath
+            _anlz_entries = anlz_map.get(cid, [])
+            anlz_data_path = _anlz_entries[0][0] if _anlz_entries else ''
+            usb_con.execute("""INSERT OR REPLACE INTO djmdContent (
+                ID, FolderPath, FileNameL, FileNameS, Title, ArtistID, AlbumID, GenreID,
+                BPM, Length, TrackNo, BitRate, BitDepth, Commnt, FileType, Rating,
+                ReleaseYear, RemixerID, LabelID, OrgArtistID, KeyID, StockDate, ColorID,
+                DJPlayCount, ImagePath, MasterDBID, MasterSongID, AnalysisDataPath,
+                SearchStr, FileSize, DiscNo, ComposerID, Subtitle, SampleRate,
+                DisableQuantize, Analysed, ReleaseDate, DateCreated, ContentLink, Tag,
+                ModifiedByRBM, HotCueAutoLoad, DeliveryControl, DeliveryComment,
+                CueUpdated, AnalysisUpdated, TrackInfoUpdated, Lyricist, ISRC,
+                SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate,
+                LyricStatus, ServiceID, OrgFolderPath,
+                Reserved1, Reserved2, Reserved3, Reserved4, ExtInfo,
+                rb_file_id, DeviceID, rb_LocalFolderPath,
+                SrcID, SrcTitle, SrcArtistName, SrcAlbumName, SrcLength,
+                UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                usn, rb_local_usn, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (str(db_id), usb_audio_rel, filename, file_name_s,
+                 title or filename, artist_id, str(album_id) if album_id else '', str(genre_id) if genre_id else '',
+                 bpm, length, track_no or 0, bitrate, 0, comment, ftype, rating or 0,
+                 release_year or 0, str(remixer_id) if remixer_id else '', str(label_id) if label_id else '', str(org_artist_id) if org_artist_id else '', key_id, '', color_id,
+                 0, usb_image_path, usb_db_id, str(db_id), anlz_data_path or '',
+                 search_str, file_size or 0, disc_no or 0, str(composer_id) if composer_id else '', '', samplerate,
+                 0, 1, '', ts(), 0, '',
+                 '', '', '', '', '', '', '', lyricist or '', '',
+                 0, 0, 0.0, '', 0, 0, '',
+                 '', '', '', '', '',
+                 '', '', '',
+                 '', '', '', '', 0,
+                 track_uuid or new_uuid(), 257, 0, 0, 0,
                  usn, usn, ts(), ts()))
-
-    print()  # newline after progress
-    usb_con.commit()
-    print(f"  ✅ Audio:  {copied_audio} local, {skipped_audio} already present, {len(missing_audio)} missing")
-    if fetch_nas:
-        print(f"  🌐 NAS:   {fetched_from_nas} fetched, {nas_fetch_failed} failed")
-    print(f"  ✅ ANLZ:     {copied_anlz} new files")
-    print(f"  🎨 Artwork: {copied_artwork} new files")
-
-    # ── Rebuild playlist structure ────────────────────────────────────────────
-    if mode == 'push':
-        # Push mode: merge into existing playlist tree (don't wipe)
-        existing_playlist_ids = set(
-            str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdPlaylist").fetchall()
-        )
-        existing_song_keys = set(
-            (str(r[0]), str(r[1])) for r in usb_con.execute(
-                "SELECT PlaylistID, ContentID FROM djmdSongPlaylist"
-            ).fetchall()
-        )
-    else:
-        # Update / mirror: wipe and rebuild from scratch
-        usb_con.execute("DELETE FROM djmdPlaylist")
-        usb_con.execute("DELETE FROM djmdSongPlaylist")
-        existing_playlist_ids = set()
-        existing_song_keys = set()
-
-    # Build ancestor paths for all selected playlists
-    master = open_db(MASTER_DB)
-
-    needed_paths = set()
-    for path, (pl_id, attr) in tree.items():
-        if attr == 0 and pl_id in playlist_ids:
-            for i in range(1, len(path) + 1):
-                needed_paths.add(path[:i])
-
-    # Determine which content IDs are valid on USB for playlist links
-    usb_valid_ids = set(
-        str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdContent").fetchall()
-    )
-
-    manifest_nodes = []
-    pl_count = fold_count = link_count = 0
-    sibling_seq = {}
-
-    for path in sorted(needed_paths, key=lambda p: (len(p), p)):
-        item = tree.get(path)
-        if not item:
-            continue
-        pl_id, attr = item
-        parent_path  = path[:-1]
-        parent_db_id = tree.get(parent_path, ('root',))[0] if parent_path else 'root'
-
-        seq_key = str(parent_db_id)
-        seq = sibling_seq.get(seq_key, 0)
-        sibling_seq[seq_key] = seq + 1
-
-        manifest_nodes.append((int(pl_id), int(parent_db_id) if parent_db_id != 'root' else 0, attr))
-
-        if mode == 'push' and str(pl_id) in existing_playlist_ids:
-            # Push mode: playlist already exists — don't recreate, just add new tracks
-            if attr == 0:
-                pl_count += 1
-                links = master.execute(
-                    "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
-                    (str(pl_id),)
+    
+            # DB: cues (replace on sync to pick up changes)
+            # master.db djmdCue column order (SELECT *):
+            #   0:ID 1:ContentID 2:InMsec 3:InFrame 4:InMpegFrame 5:InMpegAbs
+            #   6:OutMsec 7:OutFrame 8:OutMpegFrame 9:OutMpegAbs 10:Kind 11:Color
+            #   12:ColorTableIndex 13:ActiveLoop 14:Comment 15:BeatLoopSize 16:CueMicrosec
+            #   17:InPointSeekInfo 18:OutPointSeekInfo 19:ContentUUID 20:UUID
+            #   21:rb_data_status 22:rb_local_data_status 23:rb_local_deleted
+            #   24:rb_local_synced 25:usn 26:rb_local_usn 27:created_at 28:updated_at
+            usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID=?", (str(db_id),))
+            for cue in cues.get(cid, []):
+                usb_con.execute("""INSERT OR IGNORE INTO djmdCue (
+                    ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs,
+                    OutMsec, OutFrame, OutMpegFrame, OutMpegAbs, Kind, Color,
+                    ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, CueMicrosec,
+                    InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID,
+                    rb_data_status, rb_local_data_status,
+                    rb_local_deleted, rb_local_synced, usn, rb_local_usn, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+                    (cue[0], str(db_id), cue[2], cue[3], cue[4], cue[5],
+                     cue[6], cue[7], cue[8], cue[9], cue[10], cue[11],
+                     cue[12], cue[13], cue[14], cue[15], cue[16],
+                     cue[17], cue[18], cue[19], cue[20],
+                     usn, usn, ts(), ts()))
+    
+        print()  # newline after progress
+        usb_con.commit()
+        print(f"  ✅ Audio:  {copied_audio} local, {skipped_audio} already present, {len(missing_audio)} missing")
+        if fetch_nas:
+            print(f"  🌐 NAS:   {fetched_from_nas} fetched, {nas_fetch_failed} failed")
+        print(f"  ✅ ANLZ:     {copied_anlz} new files ({generated_anlz} auto-generated)")
+        print(f"  🎨 Artwork: {copied_artwork} new files")
+    
+        # ── Rebuild playlist structure ────────────────────────────────────────────
+        if mode == 'push':
+            # Push mode: merge into existing playlist tree (don't wipe)
+            existing_playlist_ids = set(
+                str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdPlaylist").fetchall()
+            )
+            existing_song_keys = set(
+                (str(r[0]), str(r[1])) for r in usb_con.execute(
+                    "SELECT PlaylistID, ContentID FROM djmdSongPlaylist"
                 ).fetchall()
-                for link in links:
-                    if str(link[1]) in usb_valid_ids and (str(pl_id), str(link[1])) not in existing_song_keys:
-                        usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
-                            (ID,PlaylistID,ContentID,TrackNo,UUID,
-                             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-                             rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
-                            (str(link[0]), str(pl_id), str(link[1]), link[2],
-                             new_uuid(), usn, ts(), ts()))
-                        link_count += 1
-            else:
-                fold_count += 1
+            )
         else:
-            usb_con.execute("""INSERT OR REPLACE INTO djmdPlaylist
-                (ID,Seq,Name,Attribute,ParentID,UUID,
-                 rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-                 rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?)""",
-                (str(pl_id), seq, path[-1], attr,
-                 str(parent_db_id) if parent_db_id != 'root' else 'root',
-                 new_uuid(), usn, ts(), ts()))
-
-            if attr == 0:
-                pl_count += 1
-                links = master.execute(
-                    "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
-                    (str(pl_id),)
-                ).fetchall()
-                for link in links:
-                    if str(link[1]) in usb_valid_ids:
-                        usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
-                            (ID,PlaylistID,ContentID,TrackNo,UUID,
-                             rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-                             rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
-                            (str(link[0]), str(pl_id), str(link[1]), link[2],
-                             new_uuid(), usn, ts(), ts()))
-                        link_count += 1
-            else:
-                fold_count += 1
-
-    master.close()
-    usb_con.commit()
-    checkpoint("Tracks & playlists committed to DB")
-    print(f"  ✅ Playlists: {pl_count} playlists, {fold_count} folders, {link_count} links")
-
-    # ── Mirror mode: orphan cleanup ───────────────────────────────────────────
-    if mode == 'mirror':
-        orphan_rows = usb_con.execute(
-            "SELECT c.ID, c.FolderPath FROM djmdContent c WHERE NOT EXISTS "
-            "(SELECT 1 FROM djmdSongPlaylist sp WHERE sp.ContentID = c.ID)"
-        ).fetchall()
-        if orphan_rows:
-            orphan_ids = [r[0] for r in orphan_rows]
-            orphan_paths = [r[1] for r in orphan_rows]
-            ph_orph = ','.join('?' * len(orphan_ids))
-            usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID IN ({ph_orph})", orphan_ids)
-            usb_con.execute(f"DELETE FROM djmdContent WHERE ID IN ({ph_orph})", orphan_ids)
-            # Delete orphan audio files from USB
-            for fpath in orphan_paths:
-                if fpath:
-                    audio_file = usb_path / fpath.lstrip('/')
-                    if audio_file.exists():
-                        audio_file.unlink()
-            usb_con.commit()
-            print(f"  🧹 Cleaned up {len(orphan_ids)} orphaned tracks")
-
-        # Scan /Contents/ for audio files not in DB
-        db_paths = set(
-            r[0] for r in usb_con.execute("SELECT FolderPath FROM djmdContent").fetchall()
-            if r[0]
+            # Update / mirror: wipe and rebuild from scratch
+            usb_con.execute("DELETE FROM djmdPlaylist")
+            usb_con.execute("DELETE FROM djmdSongPlaylist")
+            existing_playlist_ids = set()
+            existing_song_keys = set()
+    
+        # Build ancestor paths for all selected playlists
+        master = open_db(MASTER_DB)
+    
+        needed_paths = set()
+        for path, (pl_id, attr) in tree.items():
+            if attr == 0 and pl_id in playlist_ids:
+                for i in range(1, len(path) + 1):
+                    needed_paths.add(path[:i])
+    
+        # Determine which content IDs are valid on USB for playlist links
+        usb_valid_ids = set(
+            str(r[0]) for r in usb_con.execute("SELECT ID FROM djmdContent").fetchall()
         )
-        audio_dir = usb_path / AUDIO_DIR
-        if audio_dir.exists():
-            stale_files = 0
-            failed_deletes = 0
-            for audio_file in audio_dir.rglob('*'):
-                if audio_file.is_file():
-                    rel_path = '/' + str(audio_file.relative_to(usb_path))
-                    if rel_path not in db_paths:
-                        try:
-                            audio_file.unlink()
-                            stale_files += 1
-                        except OSError:
-                            failed_deletes += 1
-            # Clean up empty directories (album dirs first, then artist dirs)
-            for d in sorted(audio_dir.rglob('*'), reverse=True):
-                if d.is_dir():
-                    try:
-                        if not any(d.iterdir()):
-                            d.rmdir()
-                    except OSError:
-                        pass
-            if stale_files or failed_deletes:
-                msg = f"  🧹 Removed {stale_files} stale audio files from {AUDIO_DIR}/"
-                if failed_deletes:
-                    msg += f" ({failed_deletes} could not be removed — exFAT Unicode issue)"
-                print(msg)
-
-    # ── Push mode: rebuild manifest from USB DB to include all playlists ──────
-    if mode == 'push':
+    
         manifest_nodes = []
-        for r in usb_con.execute(
-            "SELECT ID, ParentID, Attribute FROM djmdPlaylist ORDER BY Seq"
-        ).fetchall():
-            parent_dec = 0 if str(r[1]) == 'root' else int(r[1])
-            manifest_nodes.append((int(r[0]), parent_dec, r[2]))
+        pl_count = fold_count = link_count = 0
+        sibling_seq = {}
+    
+        for path in sorted(needed_paths, key=lambda p: (len(p), p)):
+            item = tree.get(path)
+            if not item:
+                continue
+            pl_id, attr = item
+            parent_path  = path[:-1]
+            parent_db_id = tree.get(parent_path, ('root',))[0] if parent_path else 'root'
+    
+            seq_key = str(parent_db_id)
+            seq = sibling_seq.get(seq_key, 0)
+            sibling_seq[seq_key] = seq + 1
+    
+            manifest_nodes.append((int(pl_id), int(parent_db_id) if parent_db_id != 'root' else 0, attr))
+    
+            if mode == 'push' and str(pl_id) in existing_playlist_ids:
+                # Push mode: playlist already exists — don't recreate, just add new tracks
+                if attr == 0:
+                    pl_count += 1
+                    links = master.execute(
+                        "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
+                        (str(pl_id),)
+                    ).fetchall()
+                    for link in links:
+                        if str(link[1]) in usb_valid_ids and (str(pl_id), str(link[1])) not in existing_song_keys:
+                            usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
+                                (ID,PlaylistID,ContentID,TrackNo,UUID,
+                                 rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                                 rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
+                                (str(link[0]), str(pl_id), str(link[1]), link[2],
+                                 new_uuid(), usn, ts(), ts()))
+                            link_count += 1
+                else:
+                    fold_count += 1
+            else:
+                usb_con.execute("""INSERT OR REPLACE INTO djmdPlaylist
+                    (ID,Seq,Name,Attribute,ParentID,UUID,
+                     rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                     rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?)""",
+                    (str(pl_id), seq, path[-1], attr,
+                     str(parent_db_id) if parent_db_id != 'root' else 'root',
+                     new_uuid(), usn, ts(), ts()))
+    
+                if attr == 0:
+                    pl_count += 1
+                    links = master.execute(
+                        "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist WHERE PlaylistID=?",
+                        (str(pl_id),)
+                    ).fetchall()
+                    for link in links:
+                        if str(link[1]) in usb_valid_ids:
+                            usb_con.execute("""INSERT OR IGNORE INTO djmdSongPlaylist
+                                (ID,PlaylistID,ContentID,TrackNo,UUID,
+                                 rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+                                 rb_local_usn,created_at,updated_at) VALUES (?,?,?,?,?,0,0,0,0,?,?,?)""",
+                                (str(link[0]), str(pl_id), str(link[1]), link[2],
+                                 new_uuid(), usn, ts(), ts()))
+                            link_count += 1
+                else:
+                    fold_count += 1
+    
+        master.close()
+        usb_con.commit()
+        checkpoint("Tracks & playlists committed to DB")
+        print(f"  ✅ Playlists: {pl_count} playlists, {fold_count} folders, {link_count} links")
 
-    # ── masterPlaylists6.xml ───────────────────────────────────────────────────
-    xml_manifest = usb_rb_dir / "masterPlaylists6.xml"
-    ts_ms = now_ms()
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '',
-        '<MASTER_PLAYLIST Version="3.0.0" AutomaticSync="0">',
-        '  <PRODUCT Name="rekordbox" Version="6.8.5" Company="Pioneer DJ"/>',
-        '  <PLAYLISTS>',
-    ]
-    for (dec_id, parent_dec_id, attribute) in manifest_nodes:
-        parent_hex = to_hex(parent_dec_id) if parent_dec_id != 0 else '0'
-        lines.append(
-            f'    <NODE Id="{to_hex(dec_id)}" ParentId="{parent_hex}" '
-            f'Attribute="{attribute}" Timestamp="{ts_ms}" Lib_Type="0" CheckType="0"/>'
-        )
-    lines += ['  </PLAYLISTS>', '</MASTER_PLAYLIST>', '']
-    xml_manifest.write_text('\n'.join(lines), encoding='utf-8')
-    checkpoint("Playlist manifest written")
+        # ── Write MyTags to USB djmd DB ───────────────────────────────────────────
+        mytag_count = 0
+        song_mytag_count = 0
+        if mytag_rows_master:
+            for row in mytag_rows_master:
+                usb_con.execute("""INSERT OR IGNORE INTO djmdMyTag
+                    (ID, Seq, Name, Attribute, ParentID, UUID,
+                     rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                     usn, rb_local_usn, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+                    (str(row[0]), row[1], row[2], row[3],
+                     str(row[4]) if row[4] else None, new_uuid(),
+                     usn, usn, ts(), ts()))
+                mytag_count += 1
 
-    # ── Save sync state ────────────────────────────────────────────────────────
-    save_sync_usn(usb_con, max_master_usn)
-    usb_con.close()
+        if song_mytag_rows_master:
+            for row in song_mytag_rows_master:
+                usb_con.execute("""INSERT OR IGNORE INTO djmdSongMyTag
+                    (ID, MyTagID, ContentID, TrackNo, UUID,
+                     rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                     usn, rb_local_usn, created_at, updated_at)
+                    VALUES (?,?,?,?,?,0,0,0,0,?,?,?,?)""",
+                    (str(row[0]), str(row[1]), str(row[2]), row[3], new_uuid(),
+                     usn, usn, ts(), ts()))
+                song_mytag_count += 1
+
+        if mytag_count or song_mytag_count:
+            usb_con.commit()
+            print(f"  ✅ MyTags: {mytag_count} tag definitions, {song_mytag_count} track-tag links")
+    
+        # ── Mirror mode: orphan cleanup ───────────────────────────────────────────
+        if mode == 'mirror':
+            orphan_rows = usb_con.execute(
+                "SELECT c.ID, c.FolderPath FROM djmdContent c WHERE NOT EXISTS "
+                "(SELECT 1 FROM djmdSongPlaylist sp WHERE sp.ContentID = c.ID)"
+            ).fetchall()
+            if orphan_rows:
+                orphan_ids = [r[0] for r in orphan_rows]
+                orphan_paths = [r[1] for r in orphan_rows]
+                ph_orph = ','.join('?' * len(orphan_ids))
+                usb_con.execute(f"DELETE FROM djmdCue WHERE ContentID IN ({ph_orph})", orphan_ids)
+                usb_con.execute(f"DELETE FROM djmdContent WHERE ID IN ({ph_orph})", orphan_ids)
+                # Delete orphan audio files from USB
+                for fpath in orphan_paths:
+                    if fpath:
+                        audio_file = usb_path / fpath.lstrip('/')
+                        if audio_file.exists():
+                            audio_file.unlink()
+                usb_con.commit()
+                print(f"  🧹 Cleaned up {len(orphan_ids)} orphaned tracks")
+    
+            # Scan /Contents/ for audio files not in DB
+            db_paths = set(
+                r[0] for r in usb_con.execute("SELECT FolderPath FROM djmdContent").fetchall()
+                if r[0]
+            )
+            audio_dir = usb_path / AUDIO_DIR
+            if audio_dir.exists():
+                stale_files = 0
+                failed_deletes = 0
+                for audio_file in audio_dir.rglob('*'):
+                    if audio_file.is_file():
+                        rel_path = '/' + str(audio_file.relative_to(usb_path))
+                        if rel_path not in db_paths:
+                            try:
+                                audio_file.unlink()
+                                stale_files += 1
+                            except OSError:
+                                failed_deletes += 1
+                # Clean up empty directories (album dirs first, then artist dirs)
+                for d in sorted(audio_dir.rglob('*'), reverse=True):
+                    if d.is_dir():
+                        try:
+                            if not any(d.iterdir()):
+                                d.rmdir()
+                        except OSError:
+                            pass
+                if stale_files or failed_deletes:
+                    msg = f"  🧹 Removed {stale_files} stale audio files from {AUDIO_DIR}/"
+                    if failed_deletes:
+                        msg += f" ({failed_deletes} could not be removed — exFAT Unicode issue)"
+                    print(msg)
+    
+        # ── Push mode: rebuild manifest from USB DB to include all playlists ──────
+        if mode == 'push':
+            manifest_nodes = []
+            for r in usb_con.execute(
+                "SELECT ID, ParentID, Attribute FROM djmdPlaylist ORDER BY Seq"
+            ).fetchall():
+                parent_dec = 0 if str(r[1]) == 'root' else int(r[1])
+                manifest_nodes.append((int(r[0]), parent_dec, r[2]))
+    
+        # ── masterPlaylists6.xml ───────────────────────────────────────────────────
+        xml_manifest = usb_rb_dir / "masterPlaylists6.xml"
+        ts_ms = now_ms()
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '',
+            '<MASTER_PLAYLIST Version="3.0.0" AutomaticSync="0">',
+            '  <PRODUCT Name="rekordbox" Version="6.8.5" Company="Pioneer DJ"/>',
+            '  <PLAYLISTS>',
+        ]
+        for (dec_id, parent_dec_id, attribute) in manifest_nodes:
+            parent_hex = to_hex(parent_dec_id) if parent_dec_id != 0 else '0'
+            lines.append(
+                f'    <NODE Id="{to_hex(dec_id)}" ParentId="{parent_hex}" '
+                f'Attribute="{attribute}" Timestamp="{ts_ms}" Lib_Type="0" CheckType="0"/>'
+            )
+        lines += ['  </PLAYLISTS>', '</MASTER_PLAYLIST>', '']
+        xml_manifest.write_text('\n'.join(lines), encoding='utf-8')
+        checkpoint("Playlist manifest written")
+    
+        # ── Save sync state ────────────────────────────────────────────────────────
+        save_sync_usn(usb_con, max_master_usn)
+    except Exception as e:
+        usb_con.rollback()
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        usb_con.close()
     checkpoint("Sync state saved, USB export complete")
 
     if missing_audio:
@@ -1217,6 +1344,14 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
         "SELECT PlaylistID, ContentID, TrackNo FROM djmdSongPlaylist WHERE rb_local_deleted=0"
     ).fetchall()
 
+    # MyTag data
+    mytag_rows = src.execute(
+        "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdMyTag WHERE rb_local_deleted=0"
+    ).fetchall()
+    song_mytag_rows = src.execute(
+        "SELECT MyTagID, ContentID FROM djmdSongMyTag WHERE rb_local_deleted=0"
+    ).fetchall()
+
     src.close()
 
     n_tracks = len(content_rows)
@@ -1224,7 +1359,10 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
     n_entries = len(song_playlist_rows)
 
     if dry_run:
-        print(f"  Would create Device Library Plus DB: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries")
+        msg = f"  Would create Device Library Plus DB: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries"
+        if mytag_rows:
+            msg += f", {len(mytag_rows)} MyTag defs, {len(song_mytag_rows)} tag links"
+        print(msg)
         return True
 
     # Build ID maps (djmd uses string IDs, Device Library Plus uses integer IDs)
@@ -1386,6 +1524,25 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
             out.execute("INSERT INTO playlist_content VALUES (?,?,?)",
                         (pl_id, ct_id, safe_int(row[2])))
 
+    # Insert myTag (from djmdMyTag)
+    mytag_id_map = {}
+    if mytag_rows:
+        for i, row in enumerate(mytag_rows, 1):
+            mytag_id_map[str(row[0])] = i
+        for row in mytag_rows:
+            new_id = mytag_id_map[str(row[0])]
+            parent_old = str(row[4]) if row[4] else None
+            parent_new = mytag_id_map.get(parent_old, 0) if parent_old else 0
+            out.execute("INSERT INTO myTag VALUES (?,?,?,?,?)",
+                        (new_id, safe_int(row[1]), row[2], safe_int(row[3]), parent_new))
+
+    # Insert myTag_content (from djmdSongMyTag)
+    for row in song_mytag_rows:
+        mt_id = mytag_id_map.get(str(row[0]))
+        ct_id = content_id_map.get(str(row[1]))
+        if mt_id and ct_id:
+            out.execute("INSERT INTO myTag_content VALUES (?,?)", (mt_id, ct_id))
+
     # Insert property
     today = datetime.datetime.now().strftime('%Y-%m-%d')
     out.execute("INSERT INTO property VALUES (?,?,?,?,?,?)",
@@ -1427,7 +1584,11 @@ def convert_to_device_library_plus(djmd_db_path: Path, output_path: Path, dry_ru
             p.unlink()
 
     out_size = os.path.getsize(output_path)
-    print(f"  ✅ Device Library Plus: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries ({out_size:,} bytes)")
+    msg = f"  ✅ Device Library Plus: {n_tracks} tracks, {n_playlists} playlists, {n_entries} entries"
+    if mytag_rows:
+        msg += f", {len(mytag_rows)} MyTags"
+    msg += f" ({out_size:,} bytes)"
+    print(msg)
     return True
 
 

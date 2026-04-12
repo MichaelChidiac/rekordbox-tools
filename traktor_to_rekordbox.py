@@ -32,6 +32,8 @@ from collections import defaultdict
 from html import unescape
 from pathlib import Path
 
+from tag_config import parse_comment_tags
+
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
 DEFAULT_NML = str(Path.home() / 'Documents/Native Instruments/Traktor 3.11.1/collection.nml')
@@ -198,7 +200,11 @@ def parse_tracks(root):
             'filename':     file_,
             'cues':         [],   # filled in below
             'grid':         [],   # beat grid entries
+            'tags':         [],   # [bracket] tags from comment — filled below
         }
+
+        # Extract [bracket] tags from comment field
+        t['tags'] = parse_comment_tags(t['comment'])
 
         # Parse cue points
         for cue in entry.findall('CUE_V2'):
