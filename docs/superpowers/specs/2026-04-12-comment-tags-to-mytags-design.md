@@ -132,18 +132,25 @@ def sync_mytags(con, tracks: dict, path_to_content_id: dict,
     """
 ```
 
-**djmdMyTag schema** (existing in master.db):
+**djmdMyTag schema** (existing in master.db — all 14 columns):
 | Column | Type | Purpose |
 |--------|------|---------|
 | ID | VARCHAR(255) PK | Stable ID (CRC32 of `mytag:<name>`) |
 | Seq | INTEGER | Display order |
 | Name | VARCHAR(255) | Category or tag name |
-| Attribute | INTEGER | 0 = folder/category, 1 = tag |
+| Attribute | INTEGER | **1 = folder/category, 0 = tag** (matches djmdPlaylist convention) |
 | ParentID | VARCHAR(255) | NULL for categories, category ID for tags |
 | UUID | VARCHAR(255) | Random UUID |
+| rb_data_status | INTEGER | `0` (new row) |
+| rb_local_data_status | INTEGER | `0` |
+| rb_local_deleted | INTEGER | `0` |
+| rb_local_synced | INTEGER | `0` |
+| usn | INTEGER | Same value as rb_local_usn |
 | rb_local_usn | INTEGER | Must not be NULL |
+| created_at | DATETIME | `now_ts()` — NOT NULL |
+| updated_at | DATETIME | `now_ts()` — NOT NULL |
 
-**djmdSongMyTag schema** (existing in master.db):
+**djmdSongMyTag schema** (existing in master.db — all 14 columns):
 | Column | Type | Purpose |
 |--------|------|---------|
 | ID | VARCHAR(255) PK | Stable ID |
@@ -151,35 +158,48 @@ def sync_mytags(con, tracks: dict, path_to_content_id: dict,
 | ContentID | VARCHAR(255) | FK → djmdContent.ID |
 | TrackNo | INTEGER | Sequence within the tag |
 | UUID | VARCHAR(255) | Random UUID |
+| rb_data_status | INTEGER | `0` |
+| rb_local_data_status | INTEGER | `0` |
+| rb_local_deleted | INTEGER | `0` |
+| rb_local_synced | INTEGER | `0` |
+| usn | INTEGER | Same value as rb_local_usn |
 | rb_local_usn | INTEGER | Must not be NULL |
+| created_at | DATETIME | `now_ts()` — NOT NULL |
+| updated_at | DATETIME | `now_ts()` — NOT NULL |
 
-**ID generation**: Uses existing `make_id()` pattern (CRC32-based) with collision guard:
+**ID generation**: Uses existing `make_id()` pattern (CRC32-based) with collision guard. For master.db, `make_id()` returns `str`. For USB DLP, use `int(make_id(...))`.
 - Category ID: `make_id(f'mytag-cat:{category_name}')`
 - Tag ID: `make_id(f'mytag:{tag_name}')`
 - Link ID: `make_id(f'mytag-link:{tag_id}:{content_id}')`
 
 **Idempotency**: Uses `INSERT OR IGNORE` for all rows. Re-running the script will not create duplicates.
 
+**USN update**: `next_usn()` in `traktor_to_master.py` must be updated to include `djmdMyTag` and `djmdSongMyTag` in its table scan list, so that subsequent runs don't reuse USN values.
+
 #### 4b. USB export (via `traktor_to_usb.py`)
 
-Same logic adapted for the simpler USB schema:
+**Primary write target**: `djmdMyTag`/`djmdSongMyTag` tables in the djmd-format `exportLibrary.db` (same schema as master.db, including all 14 columns with `usn` and `rb_local_usn`).
 
-**myTag table**:
+**DLP conversion**: The existing `convert_djmd_to_dlp()` function must be extended to map:
+- `djmdMyTag` → `myTag` (DLP format)
+- `djmdSongMyTag` → `myTag_content` (DLP format)
+
+**DLP myTag table** (Device Library Plus format):
 | Column | Type |
 |--------|------|
 | myTag_id | INTEGER PK |
 | sequenceNo | INTEGER |
 | name | VARCHAR |
-| attribute | INTEGER |
+| attribute | INTEGER (1 = category, 0 = tag) |
 | myTag_id_parent | INTEGER |
 
-**myTag_content table**:
+**DLP myTag_content table**:
 | Column | Type |
 |--------|------|
 | myTag_id | INTEGER |
 | content_id | INTEGER |
 
-USB uses integer IDs (auto-incrementing or CRC32 as int). The conversion reuses the same tag parsing and classification.
+USB DLP uses integer IDs (`int(make_id(...))`).
 
 ### 5. CLI Flags
 
@@ -212,6 +232,8 @@ When `--dry-run` is active:
     Mood (3 tags): dark, uplifting, hypnotic
     Style (4 tags): progressive, melodic, deep, acid
 ```
+
+**Config file on dry-run**: Do NOT write `tag_categories.json` during `--dry-run`. Instead, print the would-be config to stdout so the user can review it without side effects.
 
 ### 7. Files Changed
 
