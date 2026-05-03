@@ -61,8 +61,7 @@ from pathlib import Path
 
 # Tool locations
 TOOLS_DIR = Path(__file__).parent
-TRAKTOR_TO_REKORDBOX = TOOLS_DIR / "traktor_to_rekordbox.py"
-REBUILD_REKORDBOX = TOOLS_DIR / "rebuild_rekordbox_playlists.py"
+TRAKTOR_TO_MASTER = TOOLS_DIR / "traktor_to_master.py"
 TRAKTOR_TO_USB = TOOLS_DIR / "traktor_to_usb.py"
 
 def run_tool(tool_path, args, description):
@@ -82,26 +81,23 @@ def run_tool(tool_path, args, description):
         print(f"❌ Tool not found: {tool_path}")
         return False
 
-def sync_to_rekordbox(all_lib=False, playlists=None, dry_run=False):
-    """Sync Traktor collection to Rekordbox."""
-    print("\n📋 Step 1: Convert Traktor NML → Rekordbox XML")
+def sync_to_rekordbox(all_lib=False, playlists=None, dry_run=False, overwrite=False):
+    """Sync Traktor collection directly to Rekordbox master.db."""
     args = []
-    if all_lib or not playlists:
+    if playlists:
+        args.extend(["--playlists"] + playlists)
+    else:
         args.append("--all")
     if dry_run:
         args.append("--dry-run")
-    
-    if not run_tool(TRAKTOR_TO_REKORDBOX, args, "Converting Traktor to Rekordbox format"):
+    if overwrite:
+        args.append("--overwrite")
+
+    label = "Overwriting Rekordbox from Traktor" if overwrite else \
+            "Syncing Traktor → Rekordbox master.db"
+    if not run_tool(TRAKTOR_TO_MASTER, args, label):
         return False
-    
-    print("\n📋 Step 2: Rebuild Rekordbox playlists")
-    args = []
-    if dry_run:
-        args.append("--dry-run")
-    
-    if not run_tool(REBUILD_REKORDBOX, args, "Rebuilding Rekordbox playlists"):
-        return False
-    
+
     print("\n✅ Rekordbox sync complete!")
     return True
 
@@ -171,6 +167,9 @@ def main():
                     help='[Deprecated] Alias for --mode update')
     ap.add_argument('--dry-run', action='store_true',
                     help='Preview without writing')
+    ap.add_argument('--overwrite', action='store_true',
+                    help='[Rekordbox only] Wipe playlists/MyTags/cues before rebuild '
+                         '(Traktor = source of truth). djmdContent analysis preserved.')
     ap.add_argument('--fetch-nas', action='store_true',
                     help='Fetch missing tracks from NAS via traktor-ml')
     
@@ -186,7 +185,8 @@ def main():
         success = sync_to_rekordbox(
             all_lib=args.all,
             playlists=args.playlists,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            overwrite=args.overwrite,
         )
     elif args.to_usb:
         success = sync_to_usb(

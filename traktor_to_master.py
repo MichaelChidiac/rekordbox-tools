@@ -59,24 +59,25 @@ EXT_TO_FTYPE = {
     'm4a': 6, 'flac': 45, 'ogg': 8,
 }
 
-# Traktor color index → Rekordbox decimal color integer (RGB packed)
+# Traktor 16-color index → Rekordbox djmdColor.ID (8-color palette).
+# Rekordbox palette: 1=Pink 2=Red 3=Orange 4=Yellow 5=Green 6=Aqua 7=Blue 8=Purple
 TRAKTOR_TO_RB_COLOR = {
     0:  None,
-    1:  16711680,   # Red     #FF0000
-    2:  16737792,   # Orange  #FF6600
-    3:  16776960,   # Yellow  #FFFF00
-    4:  52224,      # Green   #00CC00
-    5:  52479,      # Blue    #00CCFF
-    6:  8388736,    # Purple  #800080
-    7:  16711935,   # Magenta #FF00FF
-    8:  65280,      # Lime    #00FF00
-    9:  65535,      # Cyan    #00FFFF
-    10: 16744448,   # Amber   #FF8000
-    11: 8388608,    # Maroon  #800000
-    12: 32768,      # DkGreen #008000
-    13: 8421376,    # Olive   #808000
-    14: 128,        # Navy    #000080
-    15: 4915330,    # Teal    #4B0082
+    1:  '2',   # Red       → Red
+    2:  '3',   # Orange    → Orange
+    3:  '4',   # Yellow    → Yellow
+    4:  '5',   # Green     → Green
+    5:  '7',   # Blue      → Blue
+    6:  '8',   # Purple    → Purple
+    7:  '1',   # Magenta   → Pink
+    8:  '5',   # Lime      → Green
+    9:  '6',   # Cyan      → Aqua
+    10: '3',   # Amber     → Orange
+    11: '2',   # Maroon    → Red
+    12: '5',   # DkGreen   → Green
+    13: '4',   # Olive     → Yellow
+    14: '7',   # Navy      → Blue
+    15: '6',   # Teal      → Aqua
 }
 
 # Traktor cue TYPE → Rekordbox cue type integer
@@ -628,21 +629,176 @@ def write_playlists_xml(xml_path: Path, manifest_nodes: list, dry_run: bool):
     print('  Done.')
 
 
+# ── Cue insert helper ────────────────────────────────────────────────────────
+
+def _insert_cues(con, content_id, track_uuid, cues, usn):
+    """Insert cue points (and loops) for one track into djmdCue."""
+    for cue in cues:
+        num    = int(cue['num'])
+        inmsc  = round(float(cue['start']) * 1000)
+        end_f  = float(cue.get('end', '-0.001'))
+        outmsc = round(end_f * 1000) if end_f > 0 else -1
+        kind   = num_to_cue_kind(num)
+        # Kind=0 → memory cue (green=3); Kind>0 → hot cue (default colour=-1)
+        color  = 3 if kind == 0 else -1
+        cue_id = make_id(f'cue:{content_id}:{kind}:{inmsc}')
+        con.execute("""INSERT OR IGNORE INTO djmdCue (
+            ID,ContentID,InMsec,InFrame,InMpegFrame,InMpegAbs,
+            OutMsec,OutFrame,OutMpegFrame,OutMpegAbs,
+            Kind,Color,ColorTableIndex,ActiveLoop,Comment,
+            BeatLoopSize,CueMicrosec,ContentUUID,UUID,
+            rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
+            rb_local_usn,created_at,updated_at)
+            VALUES (?,?,?,0,0,0,?,0,0,0,?,?,-1,0,?,0,0,?,?,0,0,0,0,?,?,?)""",
+            (cue_id, content_id, inmsc, outmsc, kind, color,
+             cue.get('name', '') or '', track_uuid, new_uuid(),
+             usn, now_ts(), now_ts()))
+
+
+def reinsert_cues_for_existing(con, selected_tracks: dict,
+                                path_to_content_id: dict, usn: int) -> int:
+    """
+    After djmdCue wipe (overwrite mode), re-insert cues for tracks already in DB.
+    Looks up each track's UUID from djmdContent.
+
+    Returns count of tracks for which cues were re-inserted.
+    """
+    n = 0
+    for tkey, t in selected_tracks.items():
+        fs_path = _location_to_fspath(t['location'])
+        cid     = path_to_content_id.get(fs_path)
+        if cid is None or not t.get('cues'):
+            continue
+        row = con.execute('SELECT UUID FROM djmdContent WHERE ID=?', (cid,)).fetchone()
+        if not row:
+            continue
+        _insert_cues(con, cid, row[0], t['cues'], usn)
+        n += 1
+    con.commit()
+    return n
+
+
+# ── Mirror: delete tracks not present in Traktor ─────────────────────────────
+
+def _compute_mirror_orphans(con, traktor_fs_paths: set) -> list:
+    """
+    Return list of djmdContent.ID strings to delete for a full mirror.
+
+    Keeps exactly ONE row per FolderPath that exists in Traktor (prefers rows
+    with rb_local_deleted=0). Deletes:
+      - all rows whose FolderPath is not in Traktor (incl. old paths)
+      - all rows already marked rb_local_deleted=1 (Rekordbox-hidden stale rows)
+      - duplicate rows for the same Traktor path (keep one canonical row)
+    """
+    rows = con.execute(
+        'SELECT ID, FolderPath, rb_local_deleted FROM djmdContent'
+    ).fetchall()
+
+    # Group rows by path
+    by_path: dict = {}
+    for cid, fp, deleted in rows:
+        by_path.setdefault(fp, []).append((str(cid), int(deleted or 0)))
+
+    keep_ids: set = set()
+    for path in traktor_fs_paths:
+        candidates = by_path.get(path, [])
+        if not candidates:
+            continue
+        # Prefer rb_local_deleted=0; fall back to first
+        active = [cid for cid, d in candidates if d == 0]
+        keep_ids.add(active[0] if active else candidates[0][0])
+
+    return [str(cid) for cid, _, _ in
+            ((cid, fp, d) for cid, fp, d in rows) if str(cid) not in keep_ids]
+
+
+def mirror_delete_orphans(con, traktor_fs_paths: set) -> dict:
+    """
+    Full mirror: keep exactly one djmdContent row per Traktor path, delete
+    everything else. Cascades to tables referencing ContentID.
+
+    Cascade tables (those still holding rows after wipe_overwrite_tables):
+      djmdMixerParam, djmdSongHistory, djmdSongSampler, djmdActiveCensor,
+      djmdSongRelatedTracks, djmdSongTagList.
+
+    Analysis data for kept rows is fully preserved (BPM, AnalysisDataPath,
+    djmdMixerParam, on-disk ANLZ files).
+
+    Returns dict of counts deleted per table.
+    """
+    orphan_ids = _compute_mirror_orphans(con, traktor_fs_paths)
+
+    counts = {'djmdContent': 0}
+    if not orphan_ids:
+        return counts
+
+    cascade_tables = ('djmdMixerParam', 'djmdSongHistory', 'djmdSongSampler',
+                      'djmdActiveCensor', 'djmdSongRelatedTracks',
+                      'djmdSongTagList')
+
+    # Chunked DELETE to stay under SQLite parameter limit
+    CHUNK = 500
+    for tbl in cascade_tables:
+        n = 0
+        for i in range(0, len(orphan_ids), CHUNK):
+            batch = orphan_ids[i:i+CHUNK]
+            placeholders = ','.join('?' * len(batch))
+            cur = con.execute(
+                f'DELETE FROM {tbl} WHERE ContentID IN ({placeholders})', batch)
+            n += cur.rowcount
+        counts[tbl] = n
+
+    n = 0
+    for i in range(0, len(orphan_ids), CHUNK):
+        batch = orphan_ids[i:i+CHUNK]
+        placeholders = ','.join('?' * len(batch))
+        cur = con.execute(
+            f'DELETE FROM djmdContent WHERE ID IN ({placeholders})', batch)
+        n += cur.rowcount
+    counts['djmdContent'] = n
+
+    con.commit()
+    return counts
+
+
+# ── Overwrite: wipe Traktor-managed tables ───────────────────────────────────
+
+def wipe_overwrite_tables(con) -> dict:
+    """
+    Wipe all rows from tables that Traktor is the source of truth for.
+    Preserves djmdContent (track analysis data) and djmdArtist/djmdKey/djmdColor.
+
+    Returns counts deleted per table.
+    """
+    counts = {}
+    for tbl in ('djmdSongPlaylist',       'djmdPlaylist',
+                'djmdSongMyTag',          'djmdMyTag',
+                'djmdSongHotCueBanklist', 'djmdCue'):
+        n = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+        con.execute(f'DELETE FROM {tbl}')
+        counts[tbl] = n
+    con.commit()
+    return counts
+
+
 # ── Core Sync: Tracks ─────────────────────────────────────────────────────────
 
-def sync_tracks(con, selected_tracks: dict, usn: int) -> tuple:
+def sync_tracks(con, selected_tracks: dict, usn: int, refresh_existing: bool = True) -> tuple:
     """
     Insert new tracks into djmdContent and their cue points into djmdCue.
-    Tracks already present in DB (by FolderPath) are skipped — not updated.
+
+    Existing tracks (matched by FolderPath) get ColorID/Rating/Commnt refreshed
+    from the Traktor source when refresh_existing is True (default), so colour
+    tags propagate even without --overwrite.
 
     Args:
-        con:             Open SQLCipher connection (read-write)
-        selected_tracks: {traktor_key: track_dict} — all tracks needed by selected playlists
-        usn:             Session USN counter (obtained once via next_usn)
+        con:               Open SQLCipher connection (read-write)
+        selected_tracks:   {traktor_key: track_dict}
+        usn:               Session USN counter
+        refresh_existing:  If True, UPDATE existing rows' ColorID/Rating/Commnt
 
     Returns:
-        (path_to_content_id, new_count, skipped_count)
-        path_to_content_id: {filesystem_path: content_id_str} for ALL selected tracks
+        (path_to_content_id, new_count, updated_count, skipped_count)
     """
     # Load existing FolderPath → ID map from DB
     db_paths = {
@@ -683,20 +839,36 @@ def sync_tracks(con, selected_tracks: dict, usn: int) -> tuple:
 
     # Partition into new vs. already-present
     to_insert           = []   # [(fs_path, track_dict), ...]
+    to_update           = []   # [(fs_path, track_dict), ...] — existing rows
     path_to_content_id  = {}   # populated for both new and existing
 
     for tkey, t in selected_tracks.items():
         fs_path = _location_to_fspath(t['location'])
         if fs_path in db_paths:
             path_to_content_id[fs_path] = db_paths[fs_path]
+            if refresh_existing:
+                to_update.append((fs_path, t))
         else:
             to_insert.append((fs_path, t))
 
     new_count     = 0
-    skipped_count = len(path_to_content_id)
+    updated_count = 0
+    skipped_count = len(path_to_content_id) - len(to_update)
+
+    # Refresh colour/rating/comment on existing tracks
+    for fs_path, t in to_update:
+        cid    = path_to_content_id[fs_path]
+        rating = int(t.get('rating', '0') or '0')
+        con.execute("""UPDATE djmdContent
+            SET ColorID=?, Rating=?, Commnt=?, rb_local_usn=?, updated_at=?
+            WHERE ID=?""",
+            (t['rb_color'], rating, t['comment'], usn, now_ts(), cid))
+        updated_count += 1
+    if to_update:
+        con.commit()
 
     if not to_insert:
-        return path_to_content_id, new_count, skipped_count
+        return path_to_content_id, new_count, updated_count, skipped_count
 
     # Optional progress bar for large inserts
     iterable = (
@@ -714,6 +886,8 @@ def sync_tracks(con, selected_tracks: dict, usn: int) -> tuple:
         samplerate = 44100  # Traktor NML does not reliably expose samplerate
         key_id     = tonality_to_key_id(t['key'], key_map) or None
         artist_id  = get_or_create_artist(t['artist'])
+        rating     = int(t.get('rating', '0') or '0')
+        color_id   = t['rb_color']
 
         content_id = make_id(f'track:{fs_path}')
         # CRC32 collision guard
@@ -728,38 +902,19 @@ def sync_tracks(con, selected_tracks: dict, usn: int) -> tuple:
             FileType,BitRate,SampleRate,Commnt,Rating,ColorID,KeyID,
             UUID,rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
             rb_local_usn,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,257,0,0,0,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,257,0,0,0,?,?,?)""",
             (content_id, fs_path, t['filename'], t['title'], artist_id,
              bpm_int, length_sec, ftype, bitrate, samplerate,
-             t['comment'], key_id, track_uuid, usn, now_ts(), now_ts()))
+             t['comment'], rating, color_id, key_id, track_uuid,
+             usn, now_ts(), now_ts()))
 
-        # Insert cue points
-        for cue in t['cues']:
-            num    = int(cue['num'])
-            inmsc  = round(float(cue['start']) * 1000)
-            end_f  = float(cue.get('end', '-0.001'))
-            outmsc = round(end_f * 1000) if end_f > 0 else -1
-            kind   = num_to_cue_kind(num)
-            # Kind=0 → memory cue (green=3); Kind>0 → hot cue (default colour=-1)
-            color  = 3 if kind == 0 else -1
-            cue_id = make_id(f'cue:{content_id}:{kind}:{inmsc}')
-            con.execute("""INSERT OR IGNORE INTO djmdCue (
-                ID,ContentID,InMsec,InFrame,InMpegFrame,InMpegAbs,
-                OutMsec,OutFrame,OutMpegFrame,OutMpegAbs,
-                Kind,Color,ColorTableIndex,ActiveLoop,Comment,
-                BeatLoopSize,CueMicrosec,ContentUUID,UUID,
-                rb_data_status,rb_local_data_status,rb_local_deleted,rb_local_synced,
-                rb_local_usn,created_at,updated_at)
-                VALUES (?,?,?,0,0,0,?,0,0,0,?,?,-1,0,?,0,0,?,?,0,0,0,0,?,?,?)""",
-                (cue_id, content_id, inmsc, outmsc, kind, color,
-                 cue.get('name', '') or '', track_uuid, new_uuid(),
-                 usn, now_ts(), now_ts()))
+        _insert_cues(con, content_id, track_uuid, t['cues'], usn)
 
         path_to_content_id[fs_path] = content_id
         new_count += 1
 
     con.commit()
-    return path_to_content_id, new_count, skipped_count
+    return path_to_content_id, new_count, updated_count, skipped_count
 
 
 # ── Core Sync: Playlists ──────────────────────────────────────────────────────
@@ -916,7 +1071,8 @@ def sync_mytags(con, tracks: dict, path_to_content_id: dict,
     # Insert track-tag links into djmdSongMyTag
     track_no_counter: dict[str, int] = {}  # tag_id → next TrackNo
     for traktor_key, t in tracks.items():
-        content_id = path_to_content_id.get(t.get('location', ''))
+        fs_path    = _location_to_fspath(t.get('location', ''))
+        content_id = path_to_content_id.get(fs_path)
         if not content_id:
             continue
         for tag_name in t.get('tags', []):
@@ -965,6 +1121,13 @@ def main():
                            help='Enable comment-to-MyTag conversion (default: on)')
     tag_group.add_argument('--no-tags', action='store_true',
                            help='Skip MyTag conversion')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Full mirror: wipe playlists/song-playlist links/MyTags/'
+                             'MyTag links/cues, delete tracks not present in Traktor, '
+                             'then rebuild from Traktor. Analysis data for surviving '
+                             'tracks is preserved (BPM, AnalysisDataPath, MixerParam, '
+                             'and on-disk ANLZ files all kept). ColorID/Rating/Commnt '
+                             'refreshed from Traktor.')
     args = parser.parse_args()
     do_tags = args.tags and not args.no_tags
 
@@ -998,14 +1161,42 @@ def main():
         print('❌ No playlists matched the given names. Exiting.', file=sys.stderr)
         sys.exit(1)
 
-    # Gather unique tracks referenced by the selected playlists
-    selected_track_keys = set()
-    for _, pl_node in selected_playlists:
-        selected_track_keys.update(pl_node['keys'])
-    selected_tracks = {k: tracks[k] for k in selected_track_keys if k in tracks}
+    # Gather unique tracks referenced by the selected playlists.
+    # In overwrite mode, sync ALL Traktor tracks so the DB is a true mirror —
+    # otherwise playlistless Traktor tracks would never be inserted.
+    if args.overwrite and args.all:
+        selected_tracks = dict(tracks)
+    else:
+        selected_track_keys = set()
+        for _, pl_node in selected_playlists:
+            selected_track_keys.update(pl_node['keys'])
+        selected_tracks = {k: tracks[k] for k in selected_track_keys if k in tracks}
 
     # ── 3. Dry run ─────────────────────────────────────────────────────────────
     if args.dry_run:
+        if args.overwrite:
+            print('\n[DRY RUN] --overwrite (full mirror):')
+            print('  Would wipe djmdPlaylist, djmdSongPlaylist, djmdMyTag, '
+                  'djmdSongMyTag, djmdSongHotCueBanklist, djmdCue')
+            # Mirror against the FULL Traktor collection, not just playlist members,
+            # so Traktor tracks outside any playlist are still preserved in DB.
+            traktor_paths = {_location_to_fspath(t['location'])
+                             for t in tracks.values()}
+            preview_con = open_db(MASTER_DB)
+            try:
+                total_n  = preview_con.execute(
+                    'SELECT COUNT(*) FROM djmdContent').fetchone()[0]
+                orphan_ids = _compute_mirror_orphans(preview_con, traktor_paths)
+                orphan_n   = len(orphan_ids)
+                kept_n     = total_n - orphan_n
+                print(f'  Would delete {orphan_n} djmdContent rows '
+                      f'(of {total_n} total): orphan paths + soft-deleted + duplicates')
+                print(f'  Would keep {kept_n} canonical rows '
+                      f'(one per matched Traktor path)')
+                print(f'  Would insert {len(traktor_paths) - kept_n} new rows '
+                      f'for Traktor paths not in DB')
+            finally:
+                preview_con.close()
         print(f'\n[DRY RUN] Would sync {len(selected_playlists)} playlists, '
               f'{len(selected_tracks)} unique tracks\n')
         for path_tuple, pl_node in selected_playlists:
@@ -1057,10 +1248,31 @@ def main():
         print(f'Syncing {len(selected_playlists)} playlists '
               f'({len(selected_tracks)} tracks) …')
 
+        # ── 6b. Overwrite mode: wipe playlists/mytags/cues + delete orphans ───
+        if args.overwrite:
+            wiped = wipe_overwrite_tables(con)
+            print('  🧹 Wiped: ' + ', '.join(f'{k}={v}' for k, v in wiped.items()))
+
+            # Full Traktor collection (not just playlist members) — so Traktor
+            # tracks outside any playlist still survive the mirror cleanup.
+            traktor_paths = {_location_to_fspath(t['location'])
+                             for t in tracks.values()}
+            mirrored = mirror_delete_orphans(con, traktor_paths)
+            print('  🪞 Mirror delete: ' +
+                  ', '.join(f'{k}={v}' for k, v in mirrored.items()))
+
         # ── 7. Insert/skip tracks in djmdContent + djmdCue ───────────────────
-        path_to_content_id, new_count, skipped_count = sync_tracks(
+        path_to_content_id, new_count, updated_count, skipped_count = sync_tracks(
             con, selected_tracks, usn
         )
+
+        # In overwrite mode djmdCue was wiped — re-insert cues for existing tracks
+        # too (new tracks already had cues inserted via sync_tracks).
+        recue_count = 0
+        if args.overwrite:
+            recue_count = reinsert_cues_for_existing(
+                con, selected_tracks, path_to_content_id, usn
+            )
 
         # ── 8. Insert/update playlists in djmdPlaylist + djmdSongPlaylist ─────
         pl_count = sync_playlists(
@@ -1103,8 +1315,10 @@ def main():
         con.close()
 
     # ── 10. Summary ───────────────────────────────────────────────────────────
-    print(f'\n✅ Done: {new_count} new tracks added, {skipped_count} already in DB, '
-          f'{pl_count} playlists synced')
+    print(f'\n✅ Done: {new_count} new tracks added, {updated_count} refreshed, '
+          f'{skipped_count} unchanged, {pl_count} playlists synced')
+    if args.overwrite:
+        print(f'   🔄 Overwrite: re-inserted cues for {recue_count} existing tracks')
     if do_tags and (mytag_cats or mytag_tags or mytag_links):
         print(f'   🏷️  MyTags: {mytag_cats} categories, {mytag_tags} tags, {mytag_links} track-tag links')
 

@@ -27,9 +27,7 @@ from datetime import datetime
 
 TOOLS_DIR = Path(__file__).parent
 SYNC_MASTER = TOOLS_DIR / "sync_master.py"
-SQLCIPHER_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
-# Device Library Plus key (exportLibrary.db on USB) — different from master.db key
-EXPORT_KEY = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls"
+from config import MASTER_DB_KEY, EXPORT_DB_KEY
 MASTER_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
 SYNC_CONFIG = TOOLS_DIR / "sync_config.json"
 
@@ -53,6 +51,11 @@ class SyncHandler(BaseHTTPRequestHandler):
         
         elif parsed_path.path == '/api/history-playlists':
             self.list_history_playlists()
+
+        elif parsed_path.path == '/api/history-playlist':
+            qs = parse_qs(parsed_path.query)
+            name = (qs.get('name') or [''])[0]
+            self.get_history_playlist_detail(name)
         
         elif parsed_path.path == '/api/nas-status':
             try:
@@ -171,6 +174,27 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(400, {"error": str(e)})
     
+    def get_history_playlist_detail(self, name: str):
+        """Return JSON detail (entries + latest dateAdded) for a history playlist."""
+        if not name:
+            self.send_json(400, {"error": "missing name"})
+            return
+        node = '/usr/local/bin/node'
+        if not Path(node).exists():
+            node = 'node'
+        try:
+            result = subprocess.run(
+                [node, str(TOOLS_DIR / 'read_history.js'),
+                 '--playlist', name, '--json'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self.send_json(200, json.loads(result.stdout))
+            else:
+                self.send_json(400, {"error": result.stderr or "empty output"})
+        except Exception as e:
+            self.send_json(400, {"error": str(e)})
+
     def parse_playlist_list(self, output: str) -> list:
         """Parse output from read_history.js --list."""
         playlists = []
@@ -543,14 +567,14 @@ class SyncHandler(BaseHTTPRequestHandler):
                 if info.get('process'):
                     try:
                         info['process'].terminate()
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"Warning: {e}", file=sys.stderr)
                 for sub in info.get('sub_syncs', {}).values():
                     if sub.get('process'):
                         try:
                             sub['process'].terminate()
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"Warning: {e}", file=sys.stderr)
     
     def send_json(self, code, data):
         """Send JSON response."""
@@ -577,7 +601,7 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         try:
             con = sqlcipher3.connect(str(MASTER_DB), flags=sqlcipher3.SQLITE_OPEN_READONLY)
-            con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
+            con.execute(f"PRAGMA key='{MASTER_DB_KEY}'")
             con.execute("PRAGMA cipher='sqlcipher'")
             con.execute("PRAGMA legacy=4")  # CRITICAL
 
@@ -633,6 +657,8 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         if config.get('dry_run'):
             args.append('--dry-run')
+        if config.get('overwrite'):
+            args.append('--overwrite')
 
         cmd = [sys.executable, str(script)] + args
         print(f"[{datetime.now().isoformat()}] Running: {' '.join(cmd)}")
@@ -789,7 +815,7 @@ class SyncHandler(BaseHTTPRequestHandler):
         try:
             import sqlcipher3
             con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
-            con.execute(f"PRAGMA key='{EXPORT_KEY}'")
+            con.execute(f"PRAGMA key='{EXPORT_DB_KEY}'")
             # No legacy mode — SQLCipher 4 defaults
             con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
 
@@ -872,7 +898,7 @@ class SyncHandler(BaseHTTPRequestHandler):
         try:
             import sqlcipher3
             con = sqlcipher3.connect(str(db_path), flags=sqlcipher3.SQLITE_OPEN_READONLY)
-            con.execute(f"PRAGMA key='{SQLCIPHER_KEY}'")
+            con.execute(f"PRAGMA key='{MASTER_DB_KEY}'")
             con.execute("PRAGMA cipher='sqlcipher'")
             con.execute("PRAGMA legacy=4")
             con.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
@@ -1019,20 +1045,32 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Sync Master — Traktor ↔ Rekordbox/USB</title>
     <style>
+        :root {
+            --accent: #00bcd4;
+            --accent-hover: #00d8e8;
+            --bg-base: #0f1419;
+            --bg-surface: #1a1f26;
+            --bg-input: #232a33;
+            --bg-input-hover: #2a3140;
+            --border: #333;
+            --border-input: #444;
+            --text-primary: #e8e8e8;
+            --text-muted: #888;
+        }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #0f1419;
-            color: #e8e8e8;
+            background: var(--bg-base);
+            color: var(--text-primary);
             padding: 40px 20px;
         }
         .container { max-width: 700px; margin: 0 auto; }
-        h1 { font-size: 32px; margin-bottom: 10px; color: #00bcd4; }
-        .subtitle { color: #888; margin-bottom: 40px; }
+        h1 { font-size: 32px; margin-bottom: 10px; color: var(--accent); }
+        .subtitle { color: var(--text-muted); margin-bottom: 40px; }
         
         .panel {
-            background: #1a1f26;
-            border: 1px solid #333;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
             border-radius: 8px;
             padding: 30px;
             margin-bottom: 20px;
@@ -1042,7 +1080,7 @@ HTML_TEMPLATE = """
         .section-title {
             font-size: 14px;
             font-weight: 600;
-            color: #00bcd4;
+            color: var(--accent);
             text-transform: uppercase;
             margin-bottom: 15px;
             letter-spacing: 1px;
@@ -1054,12 +1092,12 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             padding: 12px;
-            background: #232a33;
+            background: var(--bg-input);
             border-radius: 6px;
             cursor: pointer;
             transition: background 0.2s;
         }
-        label:hover { background: #2a3140; }
+        label:hover { background: var(--bg-input-hover); }
         
         input[type="radio"], input[type="checkbox"] {
             margin-right: 12px;
@@ -1069,17 +1107,17 @@ HTML_TEMPLATE = """
         input[type="text"], select {
             width: 100%;
             padding: 12px;
-            background: #232a33;
-            border: 1px solid #444;
+            background: var(--bg-input);
+            border: 1px solid var(--border-input);
             border-radius: 6px;
-            color: #e8e8e8;
+            color: var(--text-primary);
             font-family: inherit;
             font-size: 14px;
         }
         
         input[type="text"]:focus, select:focus {
             outline: none;
-            border-color: #00bcd4;
+            border-color: var(--accent);
             box-shadow: 0 0 0 3px rgba(0, 188, 212, 0.1);
         }
         
@@ -1115,10 +1153,10 @@ HTML_TEMPLATE = """
         }
         
         .btn-primary {
-            background: #00bcd4;
+            background: var(--accent);
             color: #000;
         }
-        .btn-primary:hover { background: #00d8e8; transform: translateY(-2px); }
+        .btn-primary:hover { background: var(--accent-hover); transform: translateY(-2px); }
         .btn-primary:active { transform: translateY(0); }
         
         .btn-secondary {
@@ -1176,7 +1214,7 @@ HTML_TEMPLATE = """
         }
         .progress-fill {
             height: 100%;
-            background: #00bcd4;
+            background: var(--accent);
             animation: progress 2s infinite;
         }
         @keyframes progress {
@@ -1189,14 +1227,14 @@ HTML_TEMPLATE = """
             display: flex;
             gap: 10px;
             margin-bottom: 30px;
-            border-bottom: 1px solid #333;
+            border-bottom: 1px solid var(--border);
         }
         
         .tab-button {
             padding: 12px 20px;
             background: none;
             border: none;
-            color: #888;
+            color: var(--text-muted);
             cursor: pointer;
             font-weight: 600;
             border-bottom: 2px solid transparent;
@@ -1205,8 +1243,8 @@ HTML_TEMPLATE = """
         }
         
         .tab-button.active {
-            color: #00bcd4;
-            border-bottom-color: #00bcd4;
+            color: var(--accent);
+            border-bottom-color: var(--accent);
         }
         
         .tab-content { display: none; }
@@ -1227,7 +1265,7 @@ HTML_TEMPLATE = """
             background: none; border-radius: 0; font-weight: normal;
         }
         .tree-playlist label:hover { background: none; }
-        .tree-count { color: #888; font-size: 0.85em; }
+        .tree-count { color: var(--text-muted); font-size: 0.85em; }
         .pin-btn {
             cursor: pointer; opacity: 0.3; font-size: 0.9em;
             transition: opacity 0.2s;
@@ -1249,12 +1287,12 @@ HTML_TEMPLATE = """
         .usb-connected { background: rgba(76,175,80,0.15); color: #81c784; }
         .usb-disconnected { background: rgba(244,67,54,0.15); color: #e57373; }
         .auto-sync-btn {
-            margin-left: auto; padding: 4px 14px; background: #00bcd4;
+            margin-left: auto; padding: 4px 14px; background: var(--accent);
             color: #000; border: none; border-radius: 4px; cursor: pointer;
             font-weight: 600; font-size: 0.85em; text-transform: none;
             letter-spacing: 0; flex: none;
         }
-        .auto-sync-btn:hover { background: #00d8e8; }
+        .auto-sync-btn:hover { background: var(--accent-hover); }
     </style>
 </head>
 <body>
@@ -1341,7 +1379,7 @@ HTML_TEMPLATE = """
                     <button class="btn-primary" id="sync-btn" onclick="startSync()">Sync to USB</button>
                     <button class="btn-secondary" onclick="resetForm()">Reset</button>
                     <button class="btn-cancel" id="cancel-btn" onclick="cancelSync()" style="display:none;">⏹ Cancel</button>
-                    <span id="wipe-drive-wrap"></span><button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
+                    <button style="background:#8b0000; color:#fff; border:none; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:0.9em;" onclick="wipeUsb()">🗑️ Wipe USB</button>
                 </div>
                 
                 <!-- PROGRESS BAR -->
@@ -1394,6 +1432,10 @@ HTML_TEMPLATE = """
                             <input type="checkbox" id="traktor-dry-run">
                             Preview only (don't write to Rekordbox)
                         </label>
+                        <label>
+                            <input type="checkbox" id="traktor-overwrite">
+                            <strong>Full mirror (overwrite)</strong> — wipe playlists/MyTags/cues, delete tracks not in Traktor. Analysis (BPM, waveform, grid) preserved.
+                        </label>
                     </div>
                 </div>
 
@@ -1416,11 +1458,13 @@ HTML_TEMPLATE = """
                     
                     <div class="form-group">
                         <label>Select a history playlist from USB:</label>
-                        <select id="history-playlist">
+                        <select id="history-playlist" onchange="loadHistoryTracks()">
                             <option value="">Loading playlists...</option>
                         </select>
                     </div>
-                    
+
+                    <div id="history-preview" style="margin: 8px 0; padding: 8px; background: #111; border-radius: 4px; max-height: 320px; overflow-y: auto; font-size: 12px; display: none;"></div>
+
                     <div class="form-group">
                         <label>Give it a name in Traktor:</label>
                         <input type="text" id="history-name" value="04 - History / Live Events / " placeholder="e.g., 04 - History / Live Events / My Set">
@@ -1906,9 +1950,7 @@ HTML_TEMPLATE = """
         }
 
         function getWipeTargetPath() {
-            var sel = document.getElementById('wipe-drive-select');
-            if (sel) return sel.value;
-            return allUsbDrives.length > 0 ? allUsbDrives[0].path : null;
+            return getSelectedUsbPath();
         }
 
         var prevUsbConnected = false;
@@ -1959,24 +2001,6 @@ HTML_TEMPLATE = """
                             rebuildMirrorOptions();
                         };
                         rebuildMirrorOptions();
-                    }
-
-                    // Update wipe drive selector
-                    var wipeWrap = document.getElementById('wipe-drive-wrap');
-                    if (wipeWrap) {
-                        if (allUsbDrives.length > 1) {
-                            var prevWipeSel = document.getElementById('wipe-drive-select');
-                            var prevWipeVal = prevWipeSel ? prevWipeSel.value : null;
-                            var ws = '<select id="wipe-drive-select" style="background:#1a1a1a;color:#e0e0e0;border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:0.85em;margin-right:6px;" title="Choose USB to wipe">';
-                            allUsbDrives.forEach(function(d) {
-                                var sel = (prevWipeVal === d.path) ? ' selected' : '';
-                                ws += '<option value="' + escapeHtml(d.path) + '"' + sel + '>' + escapeHtml(d.name) + '</option>';
-                            });
-                            ws += '</select>';
-                            wipeWrap.innerHTML = ws;
-                        } else {
-                            wipeWrap.innerHTML = '';
-                        }
                     }
 
                     updateUsbAutoSyncButton();
@@ -2339,6 +2363,41 @@ HTML_TEMPLATE = """
                 });
         }
         
+        function loadHistoryTracks() {
+            var playlist = document.getElementById('history-playlist').value;
+            var preview = document.getElementById('history-preview');
+            if (!playlist) {
+                preview.style.display = 'none';
+                preview.innerHTML = '';
+                return;
+            }
+            preview.style.display = 'block';
+            preview.innerHTML = '<em>Loading tracks…</em>';
+            fetch('/api/history-playlist?name=' + encodeURIComponent(playlist))
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data || !data.entries) {
+                        preview.innerHTML = '<span style="color:#f88;">Error: ' + escapeHtml((data && data.error) || 'no data') + '</span>';
+                        return;
+                    }
+                    var header = '<div style="font-weight:600; margin-bottom:6px;">' +
+                        escapeHtml(data.playlist) + ' — ' + data.entries.length + ' tracks';
+                    if (data.latestDateAdded) {
+                        header += ' · latest track added ' + escapeHtml(data.latestDateAdded);
+                    }
+                    header += '</div>';
+                    var rows = data.entries.map(function(e) {
+                        var line = e.index + '. ' + (e.artist || 'Unknown') + ' — ' + (e.title || '');
+                        if (e.bpm && e.bpm !== '0.0') line += '  [' + e.bpm + ' BPM]';
+                        return '<div>' + escapeHtml(line) + '</div>';
+                    }).join('');
+                    preview.innerHTML = header + rows;
+                })
+                .catch(function(e) {
+                    preview.innerHTML = '<span style="color:#f88;">Error: ' + escapeHtml(e.message) + '</span>';
+                });
+        }
+
         function importHistory() {
             var playlist = document.getElementById('history-playlist').value;
             var traktorName = document.getElementById('history-name').value.trim();
@@ -2384,6 +2443,8 @@ HTML_TEMPLATE = """
             document.getElementById('history-name').value = '';
             document.getElementById('history-status').className = 'status';
             document.getElementById('history-status').innerHTML = '';
+            var preview = document.getElementById('history-preview');
+            if (preview) { preview.style.display = 'none'; preview.innerHTML = ''; }
         }
 
         // ── TRAKTOR → REKORDBOX TAB ──────────────────────────────────────
@@ -2537,6 +2598,7 @@ HTML_TEMPLATE = """
         function startTraktorSync() {
             var sel = document.querySelector('input[name="traktor-selection"]:checked').value;
             var dryRun = document.getElementById('traktor-dry-run').checked;
+            var overwrite = document.getElementById('traktor-overwrite').checked;
             var playlists = sel === 'playlists' ? getTraktorCheckedNames() : [];
 
             if (sel === 'playlists' && playlists.length === 0) {
@@ -2544,15 +2606,22 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            if (overwrite && !dryRun) {
+                if (!confirm('FULL MIRROR: this will wipe all Rekordbox playlists, MyTags, and cues, and delete tracks not present in Traktor. Analysis data (BPM, waveform, grid) is preserved. master.db is backed up first. Continue?')) {
+                    return;
+                }
+            }
+
             var status = document.getElementById('traktor-status');
             status.className = 'status loading';
-            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>'
-                + (dryRun ? 'Previewing...' : 'Syncing Traktor → Rekordbox...');
+            var label = dryRun ? 'Previewing...'
+                : (overwrite ? 'Overwriting Rekordbox from Traktor...' : 'Syncing Traktor → Rekordbox...');
+            status.innerHTML = '<div class="progress"><div class="progress-bar"><div class="progress-fill"></div></div></div>' + label;
 
             fetch('/api/traktor-sync', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ selection: sel, playlists: playlists, dry_run: dryRun })
+                body: JSON.stringify({ selection: sel, playlists: playlists, dry_run: dryRun, overwrite: overwrite })
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
@@ -2579,6 +2648,7 @@ HTML_TEMPLATE = """
             });
             traktorTree.style.display = 'none';
             document.getElementById('traktor-dry-run').checked = false;
+            document.getElementById('traktor-overwrite').checked = false;
             document.getElementById('traktor-status').className = 'status';
             document.getElementById('traktor-status').innerHTML = '';
         }
